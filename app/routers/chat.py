@@ -28,9 +28,19 @@ log = logging.getLogger(__name__)
 
 CHAT_SYSTEM = """You are RedTeam Assist, an internal AI assistant for Forvis Mazars red teamers.
 You help analysts validate penetration testing findings, correlate CVEs,
-map to MITRE ATT&CK, and prepare evidence for reporting.
+map to MITRE ATT&CK, assign an evidence-supported risk rating, and prepare findings for reporting.
 Be concise, technical, and precise. Do not speculate beyond what evidence supports.
 Do not generate exploit code or attack payloads.
+
+Your role is finding analysis and report preparation, not defensive consulting:
+- Focus on the finding title, affected scope, technical description, evidence, reproduction,
+  likelihood, impact, CVSS rationale, severity, CVE correlation, and ATT&CK mapping.
+- Do not provide fixes, patches, upgrade advice, WAF rules, hardening guidance, remediation,
+  mitigation, or "immediate recommendations" unless the analyst explicitly asks for them.
+- Do not add a Recommendations, Remediation, or Next Steps section unless explicitly requested.
+- When more information is needed, ask only for evidence that would validate or accurately
+  rate the finding. Do not suggest additional post-exploitation commands when the supplied
+  evidence already establishes the claimed impact.
 
 Knowledge base context is supplied in a [KB CONTEXT] section. Each entry is labelled with the
 source it came from. Ground your response in those entries and cite specific CVE or technique IDs.
@@ -42,6 +52,33 @@ were unavailable. Honour it:
   filling the gap from your own training data and presenting it as retrieved fact.
 - If no context was retrieved at all, answer from general knowledge but state clearly that the
   answer is not grounded in the knowledge base."""
+
+
+def _needs_retrieval(query: str) -> bool:
+    """Avoid attaching arbitrary CVEs to greetings and other social-only turns."""
+    normalized = " ".join(query.lower().strip().split()).strip(".!?,")
+    social_turns = {
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "thanks", "thank you", "ok", "okay",
+    }
+    return bool(normalized) and normalized not in social_turns
+
+
+def _social_reply(query: str) -> str | None:
+    if _needs_retrieval(query):
+        return None
+    return (
+        "Hello. Describe the finding or provide technical evidence, and I can help structure "
+        "the validation, CVSS rationale, impact, CVE correlation, and ATT&CK mapping."
+    )
+
+
+async def _conversation_outcome(
+    query: str, prior_turns: list[str], session: AsyncSession
+) -> SearchOutcome:
+    if not _needs_retrieval(query):
+        return SearchOutcome(query=query)
+    return await multimodal_search(query, session, evidence_texts=prior_turns)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -282,7 +319,10 @@ async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
 
     # normal conversational path
     query, prior_turns = _retrieval_inputs(req.messages)
-    outcome = await multimodal_search(query, session, evidence_texts=prior_turns)
+    outcome = await _conversation_outcome(query, prior_turns, session)
+    social_reply = _social_reply(query)
+    if social_reply:
+        return {"response": social_reply, **_provenance_payload(outcome)}
     messages = _build_messages_with_context(req.messages, outcome)
 
     client = AsyncLLMClient()
@@ -378,11 +418,17 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
     that the CVE feed was down.
     """
     query, prior_turns = _retrieval_inputs(req.messages)
-    outcome = await multimodal_search(query, session, evidence_texts=prior_turns)
+    outcome = await _conversation_outcome(query, prior_turns, session)
+    social_reply = _social_reply(query)
     messages = _build_messages_with_context(req.messages, outcome)
 
     async def event_generator():
         yield f"data: {json.dumps(_provenance_payload(outcome))}\n\n"
+
+        if social_reply:
+            yield f"data: {json.dumps({'token': social_reply})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            return
 
         client = AsyncLLMClient()
         try:

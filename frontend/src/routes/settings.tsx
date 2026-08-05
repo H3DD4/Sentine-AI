@@ -190,7 +190,7 @@ function SettingsPage() {
             <input type="file" className="hidden" accept=".docx,.pdf" />
             <Upload className="h-6 w-6 mx-auto text-brand-cyan mb-2" />
             <div className="text-sm font-medium">Drop a .docx template or click to upload</div>
-            <div className="text-[11px] font-mono text-muted-foreground mt-1">Max 10 MB</div>
+            <div className="mt-1 text-[11px] tabular-nums text-muted-foreground">Max 10 MB</div>
           </label>
 
           <div className="mt-4 space-y-2">
@@ -205,12 +205,12 @@ function SettingsPage() {
                 <div className="flex items-center gap-3">
                   <FileText className="h-4 w-4 text-brand-cyan" />
                   <div>
-                    <div className="text-sm font-medium font-mono">{t.name}</div>
+                    <div className="text-sm font-medium">{t.name}</div>
                     <div className="text-[11px] text-muted-foreground">{t.size}</div>
                   </div>
                 </div>
                 {t.active ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] font-mono uppercase tracking-wider text-verdict-confirmed">
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-verdict-confirmed">
                     <Check className="h-3 w-3" />
                     Active
                   </span>
@@ -242,7 +242,7 @@ function SettingsPage() {
           ) : (
             <>
               <div className="mb-5">
-                <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                   LLM Provider
                 </Label>
                 <div className="mt-2 grid grid-cols-2 md:grid-cols-3 gap-2">
@@ -270,7 +270,7 @@ function SettingsPage() {
 
               <div className="space-y-4 pt-4 border-t border-border">
                 <div>
-                  <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                  <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                     <ProviderIcon className="h-3 w-3 inline mr-1" />
                     Chat Model
                   </Label>
@@ -291,13 +291,13 @@ function SettingsPage() {
                       value={chatModel}
                       onChange={(e) => setChatModel(e.target.value)}
                       placeholder="Enter custom model name"
-                      className="mt-2 font-mono text-sm"
+                      className="mt-2 text-sm"
                     />
                   )}
                 </div>
 
                 <div>
-                  <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                  <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Validation Model
                   </Label>
                   <Select value={validationModel} onValueChange={setValidationModel}>
@@ -315,7 +315,7 @@ function SettingsPage() {
                 </div>
 
                 <div>
-                  <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                  <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Vision Model
                   </Label>
                   <Select value={visionModel} onValueChange={setVisionModel}>
@@ -334,14 +334,14 @@ function SettingsPage() {
 
                 {provider === "openai" && (
                   <div>
-                    <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                    <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                       API Base URL
                     </Label>
                     <Input
                       value={openaiBaseUrl}
                       onChange={(e) => setOpenaiBaseUrl(e.target.value)}
                       placeholder="https://api.openai.com/v1"
-                      className="mt-1.5 font-mono text-sm"
+                      className="mt-1.5 text-sm"
                     />
                     <p className="text-[10px] text-muted-foreground mt-1">
                       Use for OpenAI-compatible endpoints (DeepSeek, Mistral, etc.)
@@ -351,14 +351,14 @@ function SettingsPage() {
 
                 {provider === "ollama" && (
                   <div>
-                    <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                    <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                       Ollama Server URL
                     </Label>
                     <Input
                       value={ollamaBaseUrl}
                       onChange={(e) => setOllamaBaseUrl(e.target.value)}
                       placeholder="http://localhost:11434"
-                      className="mt-1.5 font-mono text-sm"
+                      className="mt-1.5 text-sm"
                     />
                   </div>
                 )}
@@ -366,31 +366,31 @@ function SettingsPage() {
 
               <div className="mt-4 pt-4 border-t border-border flex flex-wrap gap-2">
                 {settingsData?.anthropic_api_key_set && provider !== "anthropic" && (
-                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-verdict-confirmed/10 text-verdict-confirmed">
+                  <span className="inline-flex items-center gap-1 rounded bg-verdict-confirmed/10 px-1.5 py-0.5 text-[10px] font-medium text-verdict-confirmed">
                     <Check className="h-3 w-3" />
                     Anthropic key set
                   </span>
                 )}
                 {settingsData?.openai_api_key_set && provider !== "openai" && (
-                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-verdict-confirmed/10 text-verdict-confirmed">
+                  <span className="inline-flex items-center gap-1 rounded bg-verdict-confirmed/10 px-1.5 py-0.5 text-[10px] font-medium text-verdict-confirmed">
                     <Check className="h-3 w-3" />
                     OpenAI key set
                   </span>
                 )}
                 {settingsData?.gemini_api_key_set && provider !== "gemini" && (
-                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-verdict-confirmed/10 text-verdict-confirmed">
+                  <span className="inline-flex items-center gap-1 rounded bg-verdict-confirmed/10 px-1.5 py-0.5 text-[10px] font-medium text-verdict-confirmed">
                     <Check className="h-3 w-3" />
                     Gemini key set
                   </span>
                 )}
                 {settingsData?.together_api_key_set && provider !== "together" && (
-                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-verdict-confirmed/10 text-verdict-confirmed">
+                  <span className="inline-flex items-center gap-1 rounded bg-verdict-confirmed/10 px-1.5 py-0.5 text-[10px] font-medium text-verdict-confirmed">
                     <Check className="h-3 w-3" />
                     Together key set
                   </span>
                 )}
                 {settingsData?.ollama_available && provider !== "ollama" && (
-                  <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-verdict-confirmed/10 text-verdict-confirmed">
+                  <span className="inline-flex items-center gap-1 rounded bg-verdict-confirmed/10 px-1.5 py-0.5 text-[10px] font-medium text-verdict-confirmed">
                     <Check className="h-3 w-3" />
                     Ollama running
                   </span>

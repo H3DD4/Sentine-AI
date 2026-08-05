@@ -192,12 +192,12 @@ function Dashboard() {
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="text-sm font-semibold truncate">{e.client_name}</div>
-                      <div className="text-[11px] font-mono text-muted-foreground">
+                      <div className="text-[11px] text-muted-foreground">
                         {e.code} · {e.scope}
                       </div>
                     </div>
                     <span
-                      className={`text-[10px] font-mono uppercase tracking-wider rounded px-1.5 py-0.5 ring-1 ring-inset
+                      className={`text-[10px] font-semibold uppercase tracking-wider rounded px-1.5 py-0.5 ring-1 ring-inset
                       ${
                         e.status === "active"
                           ? "text-verdict-confirmed ring-verdict-confirmed/40 bg-verdict-confirmed/10"
@@ -211,7 +211,7 @@ function Dashboard() {
                   </div>
                   <div className="mt-3 flex items-center gap-3">
                     <Progress value={e.progress} className="h-1.5 flex-1" />
-                    <span className="text-[11px] font-mono text-muted-foreground w-10 text-right">
+                    <span className="w-10 text-right text-[11px] tabular-nums text-muted-foreground">
                       {Math.round(e.progress)}%
                     </span>
                   </div>
@@ -241,7 +241,7 @@ function Dashboard() {
 
             <div className="overflow-x-auto border border-border">
               <table className="w-full text-sm">
-                <thead className="bg-muted/50 text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+                <thead className="bg-muted/50 text-[11px] uppercase tracking-wider text-muted-foreground">
                   <tr>
                     <th className="text-left py-2.5 px-3 font-medium">Finding</th>
                     <th className="text-left py-2.5 px-3 font-medium">Sev</th>
@@ -267,7 +267,7 @@ function Dashboard() {
                       <td className="py-3 px-3">
                         <div className="flex flex-col">
                           <span className="font-medium leading-snug">{f.title}</span>
-                          <span className="text-[11px] font-mono text-muted-foreground truncate max-w-[380px]">
+                          <span className="max-w-[380px] truncate text-[11px] text-muted-foreground">
                             {f.matched_cves?.length ? f.matched_cves.join(", ") : ""}
                             {f.matched_techniques?.length
                               ? ` · ${f.matched_techniques.slice(0, 2).join(", ")}`
@@ -282,12 +282,10 @@ function Dashboard() {
                         {f.verdict ? (
                           <VerdictBadge verdict={f.verdict} size="sm" />
                         ) : (
-                          <span className="text-[11px] font-mono text-muted-foreground">
-                            not validated
-                          </span>
+                          <span className="text-[11px] text-muted-foreground">not validated</span>
                         )}
                       </td>
-                      <td className="py-3 px-3 text-right font-mono tabular-nums text-xs">
+                      <td className="px-3 py-3 text-right text-xs tabular-nums">
                         <span
                           className={
                             (f.confidence || 0) >= 85

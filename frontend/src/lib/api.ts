@@ -4,19 +4,20 @@
  * All functions use fetch() and return typed responses.
  *
  * Changes:
- * - API_BASE now uses relative URL when served from FastAPI (same origin)
- *   and falls back to localhost:8003 for dev
+ * - API_BASE uses relative URLs when served from FastAPI and supports a
+ *   VITE_API_BASE_URL override for development
  * - Added streamChat() for SSE streaming
  * - Added request abort controller support
  * - getApiKey() removed (endpoint was a security risk — removed from backend)
  */
 
-// When running behind nginx / served by FastAPI at the same origin, use "".
-// When running Vite dev server on :3000 pointing to FastAPI on :8003, use full URL.
+// Vite runs separately in development; deployed builds use the current origin.
+const configuredApiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "");
 const API_BASE =
-  typeof window !== "undefined" && window.location.port !== "8003" && window.location.port !== ""
-    ? "http://localhost:8003"
-    : "";
+  configuredApiBase ??
+  (typeof window !== "undefined" && window.location.port !== "8000" && window.location.port !== ""
+    ? "http://localhost:8000"
+    : "");
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -119,7 +120,6 @@ export interface KBEntryInput {
   references?: string[];
 }
 
-
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
@@ -130,12 +130,12 @@ export interface ChatMessage {
 // These types mirror app/kb/base.py — keep them in step.
 
 export type SourceStatus =
-  | "ok"           // searched, contributed results
-  | "no_match"     // searched, nothing matched
-  | "empty"        // nothing indexed yet
-  | "degraded"     // searched, but coverage is partial
-  | "unavailable"  // could not be searched
-  | "disabled";    // switched off by an operator
+  | "ok" // searched, contributed results
+  | "no_match" // searched, nothing matched
+  | "empty" // nothing indexed yet
+  | "degraded" // searched, but coverage is partial
+  | "unavailable" // could not be searched
+  | "disabled"; // switched off by an operator
 
 /** A source's contribution to one specific answer. */
 export interface SourceReport {
@@ -204,7 +204,57 @@ export interface ValidationResult {
   recommended_next_steps: string[];
 }
 
-export type ValidationResponse = ValidationResult & Partial<Provenance>;
+export type ValidationResponse = ValidationResult &
+  Partial<Provenance> & {
+    finding_id?: string | null;
+  };
+
+export interface ReportDraft {
+  title: string;
+  affected_scope: string;
+  description: string;
+  technical_evidence: string;
+  reproduction_steps: string[];
+  impact: string;
+  severity: string;
+  cvss_score: number | null;
+  cvss_vector: string;
+  remediation: string[];
+  matched_cves: string[];
+  matched_techniques: string[];
+  verdict: Verdict | null;
+  confidence: number | null;
+}
+
+export interface ReadinessDimension {
+  key: string;
+  label: string;
+  score: number;
+  max_score: number;
+  complete: boolean;
+}
+
+export interface ReportReadiness {
+  score: number;
+  maximum: number;
+  eligible: boolean;
+  threshold: number;
+  status: "not_ready" | "reportable" | "ready";
+  summary: string;
+  assessment_notice?: string | null;
+  strengths: string[];
+  missing: string[];
+  dimensions: ReadinessDimension[];
+  draft: ReportDraft;
+}
+
+export interface ConversationReportHandoff {
+  readiness: ReportReadiness;
+  messages: ChatMessage[];
+  finding_id?: string | null;
+}
+
+export const REPORT_HANDOFF_STORAGE_KEY = "sentinel.report.handoff.v1";
 
 export interface GhostwriterProject {
   id: string;
@@ -216,6 +266,7 @@ export interface ReportRequest {
   finding_ids: string[];
   engagement_title: string;
   client_name: string;
+  draft?: ReportDraft;
 }
 
 export interface AppSettings {
@@ -275,7 +326,7 @@ async function request<T>(
   method: string,
   path: string,
   body?: unknown,
-  signal?: AbortSignal
+  signal?: AbortSignal,
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
   const headers: Record<string, string> = {};
@@ -314,7 +365,7 @@ async function request<T>(
 
 export async function sendChatMessage(
   messages: ChatMessage[],
-  findingId?: string
+  findingId?: string,
 ): Promise<ChatResponse> {
   return request<ChatResponse>("POST", "/chat", { messages, finding_id: findingId });
 }
@@ -334,7 +385,7 @@ export function streamChatMessage(
   onDone: () => void,
   onError: (err: Error) => void,
   findingId?: string,
-  onSources?: (provenance: Provenance) => void
+  onSources?: (provenance: Provenance) => void,
 ): () => void {
   const controller = new AbortController();
 
@@ -377,7 +428,10 @@ export function streamChatMessage(
           // Errors are raised outside the try above, so a genuine backend
           // error is not swallowed by the JSON-parse handler.
           if (payload.error) throw new Error(String(payload.error));
-          if (payload.done) { onDone(); return; }
+          if (payload.done) {
+            onDone();
+            return;
+          }
           if (payload.sources && onSources) {
             onSources(payload as unknown as Provenance);
           }
@@ -400,7 +454,7 @@ export function streamChatMessage(
 export async function validateFinding(
   title: string,
   description: string,
-  files?: File[]
+  files?: File[],
 ): Promise<ValidationResponse> {
   const formData = new FormData();
   formData.append("title", title);
@@ -423,16 +477,13 @@ export async function getFinding(id: string): Promise<Finding> {
   return request<Finding>("GET", `/findings/${id}`);
 }
 
-export async function createFinding(
-  title: string,
-  description: string
-): Promise<Finding> {
+export async function createFinding(title: string, description: string): Promise<Finding> {
   return request<Finding>("POST", "/findings", { title, description });
 }
 
 export async function updateFinding(
   id: string,
-  data: { analyst_confirmed?: boolean }
+  data: { analyst_confirmed?: boolean },
 ): Promise<Finding> {
   return request<Finding>("PATCH", `/findings/${id}`, data);
 }
@@ -452,7 +503,7 @@ export async function getEngagement(id: string): Promise<Engagement> {
 }
 
 export async function createEngagement(
-  data: Omit<Engagement, "id" | "created_at" | "findings_count">
+  data: Omit<Engagement, "id" | "created_at" | "findings_count">,
 ): Promise<Engagement> {
   return request<Engagement>("POST", "/engagements", data);
 }
@@ -471,7 +522,7 @@ export async function getSources(refresh = false): Promise<SourcesResponse> {
 
 export async function reindexSource(
   sourceKey: string,
-  force = false
+  force = false,
 ): Promise<{ source: string; indexed: number; considered: number }> {
   return request("POST", `/kb/sources/${sourceKey}/reindex${force ? "?force=true" : ""}`);
 }
@@ -489,7 +540,7 @@ export async function searchKnowledgeBase(
   query: string,
   cvssMin?: number,
   sources?: string[],
-  topK?: number
+  topK?: number,
 ): Promise<KBSearchResponse> {
   const params = new URLSearchParams();
   params.set("q", query);
@@ -502,7 +553,7 @@ export async function searchKnowledgeBase(
 export async function listKnowledgeBase(
   source = "nvd",
   skip = 0,
-  limit = 50
+  limit = 50,
 ): Promise<{ source: string; label: string; entries: KBEntry[] }> {
   const params = new URLSearchParams({
     source,
@@ -513,21 +564,18 @@ export async function listKnowledgeBase(
 }
 
 export async function countKnowledgeBase(
-  source?: string
+  source?: string,
 ): Promise<{ counts?: Record<string, number>; total?: number; count?: number }> {
   return request("GET", `/kb/entries/count${source ? `?source=${source}` : ""}`);
 }
 
 export async function addKnowledgeBaseEntry(
-  entry: KBEntryInput
+  entry: KBEntryInput,
 ): Promise<{ id: string; source: string; indexed: number }> {
   return request("POST", "/kb/entries", entry);
 }
 
-export async function deleteKnowledgeBaseEntry(
-  source: string,
-  docId: string
-): Promise<void> {
+export async function deleteKnowledgeBaseEntry(source: string, docId: string): Promise<void> {
   return request<void>("DELETE", `/kb/entries/${source}/${encodeURIComponent(docId)}`);
 }
 
@@ -539,7 +587,7 @@ export async function listGhostwriterProjects(): Promise<GhostwriterProject[]> {
 
 export async function pushToGhostwriter(
   findingId: string,
-  projectId: string
+  projectId: string,
 ): Promise<{ ghostwriter_finding_id: string }> {
   return request<{ ghostwriter_finding_id: string }>("POST", "/ghostwriter/push", {
     finding_id: findingId,
@@ -548,6 +596,10 @@ export async function pushToGhostwriter(
 }
 
 // ─── Reports ──────────────────────────────────────────────────────────
+
+export async function assessReportReadiness(messages: ChatMessage[]): Promise<ReportReadiness> {
+  return request<ReportReadiness>("POST", "/reports/readiness", { messages });
+}
 
 export async function generateReport(requestData: ReportRequest): Promise<Blob> {
   return request<Blob>("POST", "/reports/generate", requestData);
@@ -559,9 +611,7 @@ export async function getSettings(): Promise<AppSettings> {
   return request<AppSettings>("GET", "/settings");
 }
 
-export async function updateSettings(
-  data: Partial<AppSettings>
-): Promise<AppSettings> {
+export async function updateSettings(data: Partial<AppSettings>): Promise<AppSettings> {
   return request<AppSettings>("PATCH", "/settings", data);
 }
 

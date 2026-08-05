@@ -45,7 +45,7 @@ You MUST respond ONLY with a valid JSON object matching this exact schema:
   "matched_cves": ["CVE-YYYY-NNNNN", ...],
   "matched_techniques": ["T1234", "T1234.001", ...],
   "missing_evidence": ["<what additional evidence would raise confidence>", ...],
-  "recommended_next_steps": ["<actionable step>", ...]
+  "recommended_next_steps": ["<missing evidence needed to validate or rate the finding>", ...]
 }
 
 Rules:
@@ -61,6 +61,11 @@ Rules:
 - If no context was retrieved at all, the only defensible verdicts are "insufficient" or
   "false_positive", and "reasoning" must say the finding could not be checked against the KB.
 - Be specific in reasoning — name the exact evidence that led to each conclusion.
+- recommended_next_steps is only for evidence collection needed to validate or accurately rate
+  the finding. Do not return fixes, patches, upgrades, WAF rules, hardening, mitigation, or
+  remediation advice.
+- Do not suggest additional post-exploitation commands when existing evidence already confirms
+  the claimed impact.
 - No prose outside the JSON object. No markdown fences. Raw JSON only."""
 
 

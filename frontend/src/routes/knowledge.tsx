@@ -31,7 +31,7 @@ function KnowledgePage() {
     refetchInterval: 60_000,
   });
 
-  const sources = health?.sources ?? [];
+  const sources = useMemo(() => health?.sources ?? [], [health]);
   const searchMode = q.trim().length >= 2;
 
   const browseSource = useMemo(() => {
@@ -104,7 +104,7 @@ function KnowledgePage() {
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold text-brand-navy">Source availability</div>
             {health && (
-              <div className="text-[11px] font-mono text-muted-foreground">
+              <div className="text-[11px] tabular-nums text-muted-foreground">
                 {health.usable_count}/{health.total_count} searchable
               </div>
             )}
@@ -117,7 +117,7 @@ function KnowledgePage() {
               >
                 <div className="min-w-0">
                   <SourceBadge source={s} showCount={false} />
-                  <div className="mt-1 text-[10px] font-mono text-muted-foreground">
+                  <div className="mt-1 text-[10px] tabular-nums text-muted-foreground">
                     {s.vector_count.toLocaleString()} vectors · {s.row_count.toLocaleString()} rows
                     {s.unsynced_count > 0 && (
                       <span className="text-verdict-review">
@@ -198,7 +198,7 @@ function KnowledgePage() {
         )}
 
         <div className="flex items-center justify-between">
-          <div className="text-xs font-mono uppercase tracking-wider text-muted-foreground">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             {isLoading ? "Loading…" : `${items.length} ${searchMode ? "results" : "entries"}`}
           </div>
         </div>
@@ -223,13 +223,13 @@ function KnowledgePage() {
                 />
 
                 <div className="flex items-start justify-between gap-2 mb-3">
-                  <div className="text-[11px] font-mono font-semibold text-brand-cyan truncate">
+                  <div className="truncate text-[11px] font-semibold text-brand-cyan">
                     {entry.doc_id}
                   </div>
                   {entry.cvss_v3 ? (
                     <span
                       className={cn(
-                        "shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded ring-1 ring-inset",
+                        "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold tabular-nums ring-1 ring-inset",
                         entry.cvss_v3 >= 9.0
                           ? "text-sev-critical ring-sev-critical/40 bg-sev-critical/10"
                           : entry.cvss_v3 >= 7.0
@@ -242,7 +242,7 @@ function KnowledgePage() {
                       CVSS {entry.cvss_v3.toFixed(1)}
                     </span>
                   ) : entry.score !== undefined ? (
-                    <span className="shrink-0 text-[10px] font-mono px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                    <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
                       {entry.score.toFixed(3)}
                     </span>
                   ) : null}
@@ -268,7 +268,7 @@ function KnowledgePage() {
 
                 {/* Every card names its source. Which corpus a claim came from
                     changes how much weight it carries in a client report. */}
-                <div className="flex items-center justify-between pt-3 border-t border-border text-[11px] font-mono">
+                <div className="flex items-center justify-between border-t border-border pt-3 text-[11px]">
                   <span className="text-muted-foreground">{labelFor(entry.source)}</span>
                   <span className="flex items-center gap-2">
                     {entry.synced === false && (
@@ -339,7 +339,7 @@ function FilterChip({
 
 function Tag({ children }: { children: React.ReactNode }) {
   return (
-    <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-mono text-muted-foreground">
+    <span className="rounded-sm bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
       {children}
     </span>
   );

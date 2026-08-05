@@ -55,7 +55,6 @@
   --color-sidebar-ring: var(--sidebar-ring);
 
   --font-sans: "Source Sans 3", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 :root {
@@ -164,9 +163,8 @@
     -webkit-tap-highlight-color: transparent;
   }
   code,
-  pre,
-  .font-mono {
-    font-family: var(--font-mono);
+  pre {
+    font-family: var(--font-sans);
   }
   ::selection {
     background: rgba(0, 114, 206, 0.18);

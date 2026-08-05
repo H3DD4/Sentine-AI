@@ -63,8 +63,12 @@ async def create_finding(
     )
     session.add(finding)
     await session.commit()
-    await session.refresh(finding)
-    return finding
+    result = await session.execute(
+        select(Finding)
+        .options(selectinload(Finding.evidence))
+        .where(Finding.id == finding.id)
+    )
+    return result.scalar_one()
 
 
 @router.patch("/{finding_id}", response_model=FindingOut)
@@ -85,8 +89,12 @@ async def update_finding(
     if update.analyst_confirmed is not None:
         finding.analyst_confirmed = update.analyst_confirmed
     await session.commit()
-    await session.refresh(finding)
-    return finding
+    result = await session.execute(
+        select(Finding)
+        .options(selectinload(Finding.evidence))
+        .where(Finding.id == finding_id)
+    )
+    return result.scalar_one()
 
 
 @router.delete("/{finding_id}", status_code=204)

@@ -114,6 +114,7 @@ async def validate_endpoint(
     data = outcome.to_dict()
     return ValidationResponse(
         **result.model_dump(),
+        finding_id=finding.id,
         sources=data["sources"],
         sources_used=data["sources_used"],
         provenance=data["provenance"],

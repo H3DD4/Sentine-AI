@@ -8,16 +8,27 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { listFindings, generateReport } from "@/lib/api";
-import type { Finding } from "@/lib/api";
+import { generateReport, listFindings, REPORT_HANDOFF_STORAGE_KEY } from "@/lib/api";
+import type { ConversationReportHandoff, Finding } from "@/lib/api";
 import { ListSkeleton } from "@/components/ui/loading-skeletons";
 import { toast } from "sonner";
-import { FileDown, FileText, CheckCircle2, Layers, Loader2, CheckCircle } from "lucide-react";
+import { AlertCircle, CheckCircle, CheckCircle2, FileDown, FileText, Layers } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/report")({ component: ReportPage });
 
+function loadConversationHandoff(): ConversationReportHandoff | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(REPORT_HANDOFF_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as ConversationReportHandoff) : null;
+  } catch {
+    return null;
+  }
+}
+
 function ReportPage() {
+  const [conversationHandoff] = useState(loadConversationHandoff);
   const [clientName, setClientName] = useState("");
   const [engagementTitle, setEngagementTitle] = useState("");
   // DOCX only, because that is the one format the backend actually produces
@@ -39,8 +50,9 @@ function ReportPage() {
     mutationFn: async () => {
       const blob = await generateReport({
         finding_ids: selectedFindingIds,
-        engagement_title: engagementTitle || "Penetration Test Report",
-        client_name: clientName || "Client",
+        engagement_title: engagementTitle.trim(),
+        client_name: clientName.trim(),
+        draft: conversationHandoff?.readiness.draft,
       });
       // Trigger download
       const url = URL.createObjectURL(blob);
@@ -53,6 +65,11 @@ function ReportPage() {
       URL.revokeObjectURL(url);
     },
     onSuccess: () => {
+      try {
+        sessionStorage.removeItem(REPORT_HANDOFF_STORAGE_KEY);
+      } catch {
+        // The download succeeded; unavailable browser storage is non-fatal.
+      }
       toast.success("Report generated", {
         description: "Your report has been downloaded successfully.",
       });
@@ -73,14 +90,18 @@ function ReportPage() {
     );
   };
 
-  const findingsCount = findings.length;
+  const availableFindings = findings.filter(
+    (finding) => finding.id !== conversationHandoff?.finding_id,
+  );
+  const findingsCount = availableFindings.length + (conversationHandoff ? 1 : 0);
+  const reportItemCount = selectedFindingIds.length + (conversationHandoff ? 1 : 0);
   const sections = [
     { name: "Executive Summary", count: "auto" },
     { name: "Scope & Methodology", count: "auto" },
     { name: "Findings Overview", count: `${findingsCount} findings` },
-    { name: "Detailed Findings", count: `${selectedFindingIds.length} selected` },
+    { name: "Detailed Findings", count: `${reportItemCount} selected` },
     { name: "MITRE ATT&CK Mapping", count: "auto" },
-    { name: "Remediation Roadmap", count: "auto" },
+    { name: "Evidence Completeness", count: "auto" },
     { name: "Appendices & Evidence", count: "auto" },
   ];
 
@@ -95,6 +116,63 @@ function ReportPage() {
       <div className="grid grid-cols-1 gap-6 px-5 py-7 md:px-8 lg:px-10 xl:grid-cols-[minmax(0,1fr)_440px]">
         {/* Form */}
         <Card className="space-y-6 border-border bg-white p-6 shadow-soft">
+          {conversationHandoff && (
+            <div className="border border-border bg-[#fafafa] p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-brand-navy">
+                    <CheckCircle2 className="h-4 w-4 text-brand-cyan" />
+                    Conversation draft included
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    {conversationHandoff.readiness.summary}
+                  </p>
+                </div>
+                <div className="text-lg font-semibold tabular-nums text-brand-navy">
+                  {conversationHandoff.readiness.score.toFixed(1)} / 10
+                </div>
+              </div>
+              <div className="mt-3 h-1.5 overflow-hidden bg-muted">
+                <div
+                  className="h-full bg-brand-cyan"
+                  style={{ width: `${conversationHandoff.readiness.score * 10}%` }}
+                />
+              </div>
+              <div className="mt-4 grid gap-3 md:grid-cols-2">
+                <DraftField label="Finding" value={conversationHandoff.readiness.draft.title} />
+                <DraftField
+                  label="Affected scope"
+                  value={conversationHandoff.readiness.draft.affected_scope}
+                />
+                <DraftField
+                  label="Technical evidence"
+                  value={conversationHandoff.readiness.draft.technical_evidence}
+                />
+                <DraftField label="Impact" value={conversationHandoff.readiness.draft.impact} />
+                <DraftField
+                  label="Severity / CVSS"
+                  value={[
+                    conversationHandoff.readiness.draft.severity,
+                    conversationHandoff.readiness.draft.cvss_score?.toFixed(1),
+                    conversationHandoff.readiness.draft.cvss_vector,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                />
+              </div>
+              {conversationHandoff.readiness.missing.length > 0 && (
+                <div className="mt-4 flex items-start gap-2 border-t border-border pt-3 text-xs text-muted-foreground">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sev-medium" />
+                  <span>
+                    <strong className="text-foreground">Still incomplete:</strong>{" "}
+                    {conversationHandoff.readiness.missing.join(", ")}. You can generate now or
+                    return to Analysis to strengthen these sections.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             <FileText className="h-4 w-4 text-brand-cyan" />
             <h2 className="text-lg font-semibold">Engagement details</h2>
@@ -113,15 +191,14 @@ function ReportPage() {
                 value={engagementTitle}
                 onChange={(e) => setEngagementTitle(e.target.value)}
                 placeholder="e.g. External PT Q1 2026"
-                className="font-mono"
               />
             </Field>
           </div>
 
           {/* Finding selector */}
           <div>
-            <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
-              Select findings to include ({selectedFindingIds.length} of {findingsCount})
+            <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Add saved findings ({selectedFindingIds.length} selected)
             </Label>
             <div className="mt-2 max-h-52 space-y-1 overflow-y-auto border border-border p-2">
               {findingsLoading && (
@@ -138,7 +215,7 @@ function ReportPage() {
                   and it will appear here.
                 </div>
               )}
-              {findings.map((f) => (
+              {availableFindings.map((f) => (
                 <button
                   key={f.id}
                   onClick={() => toggleFinding(f.id)}
@@ -160,7 +237,7 @@ function ReportPage() {
                     )}
                   </div>
                   <span className="flex-1 truncate">{f.title}</span>
-                  <span className="text-[10px] font-mono text-muted-foreground shrink-0">
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
                     {f.verdict || "pending"}
                   </span>
                 </button>
@@ -169,7 +246,7 @@ function ReportPage() {
           </div>
 
           <div>
-            <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+            <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
               Export format
             </Label>
             <div className="mt-2 flex items-center gap-2">
@@ -184,7 +261,12 @@ function ReportPage() {
             <Button
               className="min-w-40"
               onClick={() => reportMutation.mutate()}
-              disabled={reportMutation.isPending || selectedFindingIds.length === 0}
+              disabled={
+                reportMutation.isPending ||
+                reportItemCount === 0 ||
+                !clientName.trim() ||
+                !engagementTitle.trim()
+              }
             >
               {reportMutation.isPending ? (
                 <span className="h-4 w-4 mr-1.5 inline-block rounded-full border-2 border-white/30 border-t-white animate-spin" />
@@ -211,7 +293,7 @@ function ReportPage() {
 
           <div className="overflow-hidden border border-border bg-white shadow-soft">
             <div className="border-b border-border bg-white px-5 py-4">
-              <div className="text-[10px] font-mono uppercase tracking-widest text-muted-foreground">
+              <div className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
                 Confidential · TLP:RED
               </div>
               <div className="text-lg font-semibold leading-tight">
@@ -224,12 +306,12 @@ function ReportPage() {
             <ol className="divide-y divide-border">
               {sections.map((s, i) => (
                 <li key={s.name} className="flex items-center gap-3 px-4 py-3">
-                  <div className="flex h-6 w-6 items-center justify-center bg-brand-cyan-soft text-xs font-mono font-semibold text-brand-navy">
+                  <div className="flex h-6 w-6 items-center justify-center bg-brand-cyan-soft text-xs font-semibold tabular-nums text-brand-navy">
                     {String(i + 1).padStart(2, "0")}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-medium">{s.name}</div>
-                    <div className="text-[11px] font-mono text-muted-foreground">{s.count}</div>
+                    <div className="text-[11px] tabular-nums text-muted-foreground">{s.count}</div>
                   </div>
                   <CheckCircle2 className="h-4 w-4 text-verdict-confirmed" />
                 </li>
@@ -250,10 +332,23 @@ function ReportPage() {
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <Label className="text-[11px] font-mono uppercase tracking-wider text-muted-foreground">
+      <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
         {label}
       </Label>
       <div className="mt-1.5">{children}</div>
+    </div>
+  );
+}
+
+function DraftField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div className="mt-1 line-clamp-3 whitespace-pre-wrap text-sm leading-relaxed">
+        {value || "Not provided"}
+      </div>
     </div>
   );
 }

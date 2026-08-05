@@ -114,11 +114,20 @@ class AsyncLLMClient:
 
     def _anthropic(self):
         import anthropic
-        return anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        return anthropic.AsyncAnthropic(
+            api_key=settings.ANTHROPIC_API_KEY,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
 
     def _openai_compat(self, api_key: str, base_url: str):
         import openai
-        return openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        return openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
 
     def _together(self):
         return self._openai_compat(

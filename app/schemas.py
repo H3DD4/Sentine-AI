@@ -72,6 +72,7 @@ class ValidationResponse(ValidationResult):
     provenance: str = ""
     degraded: bool = False
     citations: List[RetrievedDoc] = []
+    finding_id: Optional[str] = None
 
 
 class FindingCreate(BaseModel):
@@ -89,7 +90,7 @@ class EvidenceOut(BaseModel):
     storage_path: str
     extracted_text: Optional[str] = None
     image_description: Optional[str] = None
-    uploaded_at: Optional[str] = None
+    uploaded_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -108,11 +109,11 @@ class FindingOut(BaseModel):
     recommended_next_steps: List[str] = []
     analyst_confirmed: bool = False
     ghostwriter_finding_id: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     evidence: List[EvidenceOut] = []
 
-    @field_serializer("created_at", "updated_at", mode="plain")
+    @field_serializer("created_at", "updated_at", mode="plain", when_used="json")
     def _serialize_dt(self, v: Any) -> Optional[str]:
         if v is None:
             return None
@@ -148,10 +149,51 @@ class GhostwriterPushRequest(BaseModel):
     finding_id: str
     project_id: str
 
+class ReportDraft(BaseModel):
+    title: str = ""
+    affected_scope: str = ""
+    description: str = ""
+    technical_evidence: str = ""
+    reproduction_steps: List[str] = []
+    impact: str = ""
+    severity: str = ""
+    cvss_score: Optional[float] = None
+    cvss_vector: str = ""
+    remediation: List[str] = []
+    matched_cves: List[str] = []
+    matched_techniques: List[str] = []
+    verdict: Optional[VerdictEnum] = None
+    confidence: Optional[float] = None
+
+
 class ReportRequest(BaseModel):
     finding_ids: List[str]
     engagement_title: str
     client_name: str
+    draft: Optional[ReportDraft] = None
+
+
+class ReadinessDimension(BaseModel):
+    key: str
+    label: str
+    score: float
+    max_score: float
+    complete: bool
+
+
+class ReportReadinessResponse(BaseModel):
+    score: float
+    maximum: float = 10.0
+    eligible: bool
+    threshold: float
+    status: str
+    summary: str
+    assessment_notice: Optional[str] = None
+    strengths: List[str] = []
+    missing: List[str] = []
+    dimensions: List[ReadinessDimension] = []
+    draft: ReportDraft
+
 
 class EngagementCreate(BaseModel):
     client_name: str

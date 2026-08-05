@@ -43,6 +43,7 @@ class Settings(BaseSettings):
 
     # LLM Provider Selection
     LLM_PROVIDER: LLMProvider = LLMProvider.anthropic
+    LLM_REQUEST_TIMEOUT_SECONDS: float = 45.0
 
     # Anthropic
     ANTHROPIC_API_KEY: str = ""

@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { AppShell } from "@/components/layout/AppShell";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { VerdictBadge } from "@/components/brand/Badges";
@@ -9,8 +9,20 @@ import { Textarea } from "@/components/ui/textarea";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { useRef, useState, useCallback, useEffect } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { getSources, streamChatMessage, validateFinding } from "@/lib/api";
-import type { ChatMessage, Provenance, SourcesResponse, ValidationResponse } from "@/lib/api";
+import {
+  assessReportReadiness,
+  getSources,
+  REPORT_HANDOFF_STORAGE_KEY,
+  streamChatMessage,
+  validateFinding,
+} from "@/lib/api";
+import type {
+  ChatMessage,
+  Provenance,
+  ReportReadiness,
+  SourcesResponse,
+  ValidationResponse,
+} from "@/lib/api";
 import { toast } from "sonner";
 import {
   Paperclip,
@@ -32,6 +44,9 @@ import {
   ArrowDown,
   Maximize2,
   Minimize2,
+  ClipboardCheck,
+  AlertCircle,
+  CheckCircle2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -87,7 +102,7 @@ function MarkdownText({ text }: { text: string }) {
         }
         if (part.startsWith("`") && part.endsWith("`")) {
           return (
-            <code key={i} className="bg-muted rounded px-1 py-0.5 text-[11px] font-mono">
+            <code key={i} className="rounded bg-muted px-1 py-0.5 text-[11px] font-medium">
               {part.slice(1, -1)}
             </code>
           );
@@ -108,6 +123,7 @@ function MarkdownText({ text }: { text: string }) {
 }
 
 function ChatPage() {
+  const navigate = useNavigate();
   const [messages, setMessages] = useState<Msg[]>(loadStoredMessages);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -117,6 +133,7 @@ function ChatPage() {
   const [evidenceOpen, setEvidenceOpen] = useState(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
+  const [readiness, setReadiness] = useState<ReportReadiness | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -194,12 +211,28 @@ function ChatPage() {
     setFiles([]);
     setInput("");
     setIsStreaming(false);
+    setReadiness(null);
     try {
       sessionStorage.removeItem(CHAT_STORAGE_KEY);
+      sessionStorage.removeItem(REPORT_HANDOFF_STORAGE_KEY);
     } catch {
       // Non-fatal; state is already cleared in memory.
     }
   }, []);
+
+  const reportMessages = useCallback(
+    () =>
+      messages
+        .filter((message) => !message.streaming && message.text.trim())
+        .map(
+          (message) =>
+            ({
+              role: message.from === "user" ? "user" : "assistant",
+              content: message.text,
+            }) as ChatMessage,
+        ),
+    [messages],
+  );
 
   // Cleanup stream on unmount
   useEffect(() => {
@@ -292,6 +325,57 @@ function ChatPage() {
     },
   });
 
+  const {
+    mutate: assessReadiness,
+    mutateAsync: assessReadinessAsync,
+    isPending: readinessLoading,
+    error: readinessError,
+  } = useMutation({
+    mutationFn: (conversation: ChatMessage[]) => assessReportReadiness(conversation),
+    onSuccess: setReadiness,
+    onError: (error) => {
+      toast.error("Report readiness could not be assessed", {
+        description: error instanceof Error ? error.message : "The readiness service failed.",
+      });
+    },
+  });
+
+  const evaluateReport = useCallback(() => {
+    const conversation = reportMessages();
+    if (!conversation.some((message) => message.role === "user")) {
+      toast.info("Add finding information before evaluating the report.");
+      return;
+    }
+    assessReadiness(conversation);
+  }, [assessReadiness, reportMessages]);
+
+  const openReportBuilder = useCallback(async () => {
+    const conversation = reportMessages();
+    if (!conversation.some((message) => message.role === "user")) {
+      toast.info("Add finding information before building a report.");
+      return;
+    }
+    try {
+      const currentReadiness = readiness ?? (await assessReadinessAsync(conversation));
+      setReadiness(currentReadiness);
+      sessionStorage.setItem(
+        REPORT_HANDOFF_STORAGE_KEY,
+        JSON.stringify({
+          readiness: currentReadiness,
+          messages: conversation,
+          finding_id: lastValidation?.finding_id ?? null,
+        }),
+      );
+    } catch (error) {
+      toast.error("Could not prepare report", {
+        description:
+          error instanceof Error ? error.message : "The conversation could not be prepared.",
+      });
+      return;
+    }
+    navigate({ to: "/report" });
+  }, [assessReadinessAsync, lastValidation?.finding_id, navigate, readiness, reportMessages]);
+
   const sendStream = useCallback(
     (chatMessages: ChatMessage[]) => {
       const aiMsgId = crypto.randomUUID();
@@ -352,6 +436,7 @@ function ChatPage() {
       text: input || "(attached evidence)",
       files: files.map((f) => f.name),
     };
+    setReadiness(null);
     setMessages((prev) => [...prev, userMsg]);
     const capturedInput = input;
     const capturedFiles = [...files];
@@ -423,11 +508,22 @@ function ChatPage() {
                 <Plus className="h-4 w-4 mr-1.5" />
                 New chat
               </Button>
-              <Button asChild size="sm" className={focusMode ? "hidden" : undefined}>
-                <Link to="/report">
-                  <FileDown className="h-4 w-4 mr-1.5" />
-                  Generate report
-                </Link>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={evaluateReport}
+                disabled={messages.length === 0 || readinessLoading || isStreaming}
+              >
+                <ClipboardCheck className="h-4 w-4 mr-1.5" />
+                {readinessLoading ? "Evaluating..." : "Evaluate report"}
+              </Button>
+              <Button
+                size="sm"
+                onClick={openReportBuilder}
+                disabled={messages.length === 0 || isStreaming}
+              >
+                <FileDown className="h-4 w-4 mr-1.5" />
+                Build report
               </Button>
               <Sheet>
                 <SheetTrigger asChild>
@@ -442,6 +538,14 @@ function ChatPage() {
                     sourceHealth={sourceHealth}
                     healthLoading={healthLoading}
                     lastValidation={lastValidation}
+                    readiness={readiness}
+                    readinessLoading={readinessLoading}
+                    readinessError={readinessError}
+                    onEvaluate={evaluateReport}
+                    canEvaluate={
+                      messages.some((message) => message.from === "user") && !isStreaming
+                    }
+                    onBuildReport={openReportBuilder}
                   />
                 </SheetContent>
               </Sheet>
@@ -485,6 +589,13 @@ function ChatPage() {
               evidenceOpen && "lg:border-r lg:border-border",
             )}
           >
+            <ReadinessBar
+              readiness={readiness}
+              loading={readinessLoading}
+              error={readinessError}
+              onEvaluate={evaluateReport}
+              canEvaluate={messages.some((message) => message.from === "user") && !isStreaming}
+            />
             <div
               ref={scrollAreaRef}
               onScroll={handleChatScroll}
@@ -547,7 +658,7 @@ function ChatPage() {
                             <span
                               key={f}
                               className={cn(
-                                "inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-[11px] font-mono",
+                                "inline-flex items-center gap-1 rounded-sm px-2 py-0.5 text-[11px]",
                                 m.from === "user"
                                   ? "bg-white/20 text-white"
                                   : "bg-muted text-foreground",
@@ -610,7 +721,7 @@ function ChatPage() {
                     {files.map((f, i) => (
                       <span
                         key={i}
-                        className="inline-flex items-center gap-1 rounded-sm bg-muted px-2 py-1 text-[11px] font-mono"
+                        className="inline-flex items-center gap-1 rounded-sm bg-muted px-2 py-1 text-[11px]"
                       >
                         <FileCode className="h-3 w-3 text-brand-cyan" />
                         {f.name}
@@ -681,7 +792,7 @@ function ChatPage() {
                         <Send className="h-4 w-4 mr-1.5" />
                       )}
                       Analyze
-                      <span className="ml-2 text-[10px] font-mono opacity-70">⌘↵</span>
+                      <span className="ml-2 text-[10px] opacity-70">⌘↵</span>
                     </Button>
                   </div>
                 </div>
@@ -696,6 +807,12 @@ function ChatPage() {
                 sourceHealth={sourceHealth}
                 healthLoading={healthLoading}
                 lastValidation={lastValidation}
+                readiness={readiness}
+                readinessLoading={readinessLoading}
+                readinessError={readinessError}
+                onEvaluate={evaluateReport}
+                canEvaluate={messages.some((message) => message.from === "user") && !isStreaming}
+                onBuildReport={openReportBuilder}
               />
             </aside>
           )}
@@ -705,14 +822,93 @@ function ChatPage() {
   );
 }
 
+function ReadinessBar({
+  readiness,
+  loading,
+  error,
+  onEvaluate,
+  canEvaluate,
+}: {
+  readiness: ReportReadiness | null;
+  loading: boolean;
+  error: Error | null;
+  onEvaluate: () => void;
+  canEvaluate: boolean;
+}) {
+  const score = readiness?.score ?? 0;
+  const percentage = score * 10;
+  return (
+    <div className="shrink-0 border-b border-border bg-white px-5 py-3 md:px-8 lg:px-10">
+      <div className="flex items-center gap-4">
+        <div className="hidden h-8 w-8 shrink-0 items-center justify-center border border-border bg-[#fafafa] sm:flex">
+          <ClipboardCheck className="h-4 w-4 text-brand-cyan" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
+            <span className="font-semibold text-brand-navy">Report readiness</span>
+            <span className="shrink-0 text-sm font-semibold tabular-nums text-foreground">
+              {loading ? "Assessing..." : `${score.toFixed(1)} / 10`}
+            </span>
+          </div>
+          <div className="h-1.5 overflow-hidden bg-muted" aria-label="Report readiness progress">
+            <div
+              className={cn(
+                "h-full transition-[width,background-color] duration-500",
+                readiness?.status === "ready"
+                  ? "bg-verdict-confirmed"
+                  : readiness?.eligible
+                    ? "bg-brand-cyan"
+                    : "bg-muted-foreground",
+              )}
+              style={{ width: `${percentage}%` }}
+            />
+          </div>
+          <div className="mt-1.5 text-[11px] text-muted-foreground">
+            {error
+              ? "Assessment unavailable. Check the backend connection and retry with the next message."
+              : readiness
+                ? readiness.summary
+                : "Evaluation is manual. Click Evaluate when you want a score and missing-section review."}
+          </div>
+          {readiness && (
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+              <span className="text-verdict-confirmed">
+                Present: {readiness.strengths.join(", ") || "No complete sections yet"}
+              </span>
+              <span className="text-sev-medium">
+                Missing: {readiness.missing.join(", ") || "None"}
+              </span>
+            </div>
+          )}
+        </div>
+        <Button variant="outline" size="sm" onClick={onEvaluate} disabled={!canEvaluate || loading}>
+          {loading ? "Evaluating..." : "Evaluate"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function EvidencePanel({
   sourceHealth,
   healthLoading,
   lastValidation,
+  readiness,
+  readinessLoading,
+  readinessError,
+  onEvaluate,
+  canEvaluate,
+  onBuildReport,
 }: {
   sourceHealth?: SourcesResponse;
   healthLoading: boolean;
   lastValidation: ValidationResponse | null;
+  readiness: ReportReadiness | null;
+  readinessLoading: boolean;
+  readinessError: Error | null;
+  onEvaluate: () => void;
+  canEvaluate: boolean;
+  onBuildReport: () => void;
 }) {
   return (
     <div className="space-y-6">
@@ -723,13 +919,21 @@ function EvidencePanel({
         </Card>
       </div>
 
+      <ReportAssessment
+        readiness={readiness}
+        loading={readinessLoading}
+        error={readinessError}
+        onEvaluate={onEvaluate}
+        canEvaluate={canEvaluate}
+      />
+
       <div>
         <div className="mb-2 text-xs font-semibold text-brand-navy">Validation result</div>
         <Card className="space-y-5 border-border bg-white p-5 shadow-soft">
           {lastValidation ? (
             <>
               <div>
-                <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                   Verdict
                 </div>
                 <div className="mt-2">
@@ -760,7 +964,7 @@ function EvidencePanel({
                 />
               </div>
               <div>
-                <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground mb-1">
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                   Reasoning
                 </div>
                 <p className="text-sm text-muted-foreground leading-relaxed">
@@ -769,7 +973,7 @@ function EvidencePanel({
               </div>
               {lastValidation.missing_evidence?.length > 0 && (
                 <div>
-                  <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground mb-1">
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Missing Evidence
                   </div>
                   <ul className="text-sm text-sev-critical list-disc list-inside space-y-1">
@@ -781,7 +985,7 @@ function EvidencePanel({
               )}
               {lastValidation.recommended_next_steps?.length > 0 && (
                 <div>
-                  <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground mb-1">
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Recommended Steps
                   </div>
                   <ol className="text-sm text-muted-foreground list-decimal list-inside space-y-1">
@@ -793,13 +997,13 @@ function EvidencePanel({
               )}
               {lastValidation.citations && lastValidation.citations.length > 0 && (
                 <div>
-                  <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground mb-1">
+                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Evidence Cited
                   </div>
                   <ul className="space-y-1.5">
                     {lastValidation.citations.slice(0, 6).map((c) => (
                       <li key={`${c.source}:${c.id}`} className="text-xs leading-snug">
-                        <span className="font-mono text-[10px] text-brand-cyan">
+                        <span className="text-[10px] font-semibold text-brand-cyan">
                           [{c.source_label}]
                         </span>{" "}
                         {c.url ? (
@@ -833,13 +1037,10 @@ function EvidencePanel({
                     now report on it" was invisible — the report page was
                     reachable only from the sidebar, with no indication it had
                     anything to work with. */}
-              <Link
-                to="/report"
-                className="flex w-full items-center justify-center gap-2 rounded-sm bg-brand-navy py-2.5 text-sm font-semibold text-white transition-colors hover:bg-brand-cyan"
-              >
+              <Button className="w-full" onClick={onBuildReport} disabled={readinessLoading}>
                 <FileDown className="h-4 w-4" />
-                Include in engagement report
-              </Link>
+                {readinessLoading ? "Assessing report..." : "Build engagement report"}
+              </Button>
             </>
           ) : (
             <div className="text-center py-8 text-sm text-muted-foreground">
@@ -848,6 +1049,191 @@ function EvidencePanel({
           )}
         </Card>
       </div>
+    </div>
+  );
+}
+
+function ReportAssessment({
+  readiness,
+  loading,
+  error,
+  onEvaluate,
+  canEvaluate,
+}: {
+  readiness: ReportReadiness | null;
+  loading: boolean;
+  error: Error | null;
+  onEvaluate: () => void;
+  canEvaluate: boolean;
+}) {
+  const draftFields = readiness
+    ? [
+        ["Finding", readiness.draft.title],
+        ["Affected scope", readiness.draft.affected_scope],
+        ["Description", readiness.draft.description],
+        ["Technical evidence", readiness.draft.technical_evidence],
+        ["Reproduction", readiness.draft.reproduction_steps.join("\n")],
+        ["Impact", readiness.draft.impact],
+        [
+          "Risk rating",
+          [
+            readiness.draft.severity,
+            readiness.draft.cvss_score != null
+              ? `CVSS ${readiness.draft.cvss_score.toFixed(1)}`
+              : "",
+            readiness.draft.cvss_vector,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+        ],
+        ["CVE references", readiness.draft.matched_cves.join(", ")],
+        ["ATT&CK mapping", readiness.draft.matched_techniques.join(", ")],
+      ]
+    : [];
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div className="text-xs font-semibold text-brand-navy">Report assessment</div>
+        {readiness && (
+          <span className="text-xs font-semibold tabular-nums text-brand-navy">
+            {readiness.score.toFixed(1)} / {readiness.maximum.toFixed(0)}
+          </span>
+        )}
+      </div>
+      <Card className="space-y-4 border-border bg-white p-5 shadow-soft">
+        {loading ? (
+          <div className="flex items-center gap-2 py-5 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin text-brand-cyan" />
+            Extracting and scoring the current report draft...
+          </div>
+        ) : error ? (
+          <div className="space-y-3">
+            <div className="flex gap-2 text-sm text-sev-critical">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>Evaluation failed. No readiness score was produced.</span>
+            </div>
+            <p className="text-xs leading-relaxed text-muted-foreground">{error.message}</p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={onEvaluate}
+              disabled={!canEvaluate}
+            >
+              Evaluate again
+            </Button>
+          </div>
+        ) : readiness ? (
+          <>
+            <div>
+              <div className="mb-2 h-1.5 overflow-hidden bg-muted">
+                <div
+                  className={cn(
+                    "h-full",
+                    readiness.status === "ready" ? "bg-verdict-confirmed" : "bg-brand-cyan",
+                  )}
+                  style={{ width: `${readiness.score * 10}%` }}
+                />
+              </div>
+              <p className="text-xs leading-relaxed text-muted-foreground">{readiness.summary}</p>
+            </div>
+
+            {readiness.assessment_notice && (
+              <div className="flex gap-2 border border-sev-medium/30 bg-sev-medium/5 p-3 text-xs leading-relaxed text-sev-medium">
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{readiness.assessment_notice}</span>
+              </div>
+            )}
+
+            <div className="space-y-2 border-t border-border pt-4">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Scored sections
+              </div>
+              {readiness.dimensions.map((dimension) => (
+                <div key={dimension.key} className="flex items-center gap-2 text-xs">
+                  {dimension.complete ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-verdict-confirmed" />
+                  ) : (
+                    <AlertCircle className="h-3.5 w-3.5 shrink-0 text-sev-medium" />
+                  )}
+                  <span className="min-w-0 flex-1 text-foreground">{dimension.label}</span>
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {dimension.score.toFixed(1)} / {dimension.max_score.toFixed(1)}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div className="border-t border-border pt-4">
+              <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Missing or incomplete
+              </div>
+              {readiness.missing.length > 0 ? (
+                <ul className="space-y-1.5 text-xs text-sev-critical">
+                  {readiness.missing.map((item) => (
+                    <li key={item} className="flex gap-2">
+                      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="flex gap-2 text-xs text-verdict-confirmed">
+                  <CheckCircle2 className="h-3.5 w-3.5" /> All scored sections are complete.
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3 border-t border-border pt-4">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Extracted report details
+              </div>
+              {draftFields.map(([label, value]) => (
+                <div key={label}>
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    {label}
+                  </div>
+                  <p
+                    className={cn(
+                      "mt-0.5 whitespace-pre-line text-xs leading-relaxed",
+                      value ? "text-foreground" : "italic text-sev-medium",
+                    )}
+                  >
+                    {value || "Not provided"}
+                  </p>
+                </div>
+              ))}
+            </div>
+
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={onEvaluate}
+              disabled={!canEvaluate}
+            >
+              Evaluate again
+            </Button>
+          </>
+        ) : (
+          <div className="space-y-3 py-2">
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              Evaluate the conversation to see the report details, section scores, and content that
+              is still missing.
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={onEvaluate}
+              disabled={!canEvaluate}
+            >
+              Evaluate report
+            </Button>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }
@@ -870,7 +1256,7 @@ function Metric({
         {label}
       </div>
       <div
-        className="mt-1 text-sm font-semibold font-mono truncate"
+        className="mt-1 truncate text-sm font-semibold tabular-nums"
         style={{ color: `var(--${accent})` }}
       >
         {value}
