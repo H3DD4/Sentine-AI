@@ -1,0 +1,185 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+/* Forvis Mazars-inspired product system: one calm, light workspace theme. */
+@theme inline {
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ring-offset-background: var(--background);
+
+  --color-brand-cyan: var(--brand-cyan);
+  --color-brand-navy: var(--brand-navy);
+  --color-brand-cyan-soft: var(--brand-cyan-soft);
+  --color-brand-navy-soft: var(--brand-navy-soft);
+
+  --color-sev-critical: var(--sev-critical);
+  --color-sev-high: var(--sev-high);
+  --color-sev-medium: var(--sev-medium);
+  --color-sev-low: var(--sev-low);
+  --color-sev-info: var(--sev-info);
+  --color-verdict-confirmed: var(--verdict-confirmed);
+  --color-verdict-review: var(--verdict-review);
+  --color-verdict-false: var(--verdict-false);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --font-sans: "Source Sans 3", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+:root {
+  --radius: 0.25rem;
+  --brand-cyan: #0072ce;
+  --brand-cyan-soft: #eaf4fb;
+  --brand-navy: #171c8f;
+  --brand-navy-soft: #ededf8;
+
+  --background: #f7f8f9;
+  --foreground: #2f3434;
+  --card: #ffffff;
+  --card-foreground: #2f3434;
+  --popover: #ffffff;
+  --popover-foreground: #2f3434;
+  --primary: #171c8f;
+  --primary-foreground: #ffffff;
+  --secondary: #f1f3f4;
+  --secondary-foreground: #3f4545;
+  --muted: #f1f3f4;
+  --muted-foreground: #687070;
+  --accent: #eaf4fb;
+  --accent-foreground: #171c8f;
+  --destructive: #b42318;
+  --destructive-foreground: #ffffff;
+  --border: rgba(47, 52, 52, 0.14);
+  --input: rgba(47, 52, 52, 0.22);
+  --ring: #0072ce;
+
+  --sev-critical: #b42318;
+  --sev-high: #b95c2b;
+  --sev-medium: #8a6508;
+  --sev-low: #0072ce;
+  --sev-info: #687070;
+  --verdict-confirmed: #28765b;
+  --verdict-review: #9a6700;
+  --verdict-false: #b42318;
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #3f4545;
+  --sidebar-primary: #171c8f;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f1f3f4;
+  --sidebar-accent-foreground: #171c8f;
+  --sidebar-border: rgba(47, 52, 52, 0.12);
+  --sidebar-ring: #0072ce;
+
+  --grad-brand: linear-gradient(105deg, #171c8f 0%, #0072ce 100%);
+  --grad-hero: linear-gradient(112deg, #ffffff 0%, #f4f7fa 64%, #eaf4fb 100%);
+  --grad-panel: linear-gradient(180deg, #ffffff 0%, #fafbfc 100%);
+  --shadow-soft: 0 1px 2px rgba(47, 52, 52, 0.04), 0 8px 24px rgba(47, 52, 52, 0.06);
+  --shadow-glow: 0 6px 18px rgba(23, 28, 143, 0.16);
+}
+
+@utility bg-grad-brand {
+  background-image: var(--grad-brand);
+}
+@utility bg-grad-hero {
+  background-image: var(--grad-hero);
+}
+@utility bg-grad-panel {
+  background-image: var(--grad-panel);
+}
+@utility text-grad-brand {
+  background-image: var(--grad-brand);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+@utility shadow-soft {
+  box-shadow: var(--shadow-soft);
+}
+@utility shadow-glow {
+  box-shadow: var(--shadow-glow);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+  html {
+    height: 100%;
+    color-scheme: light;
+  }
+  body {
+    min-height: 100%;
+    margin: 0;
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    font-weight: 400;
+    letter-spacing: 0;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+  button,
+  a,
+  input,
+  textarea,
+  select {
+    letter-spacing: 0;
+  }
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+  ::selection {
+    background: rgba(0, 114, 206, 0.18);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

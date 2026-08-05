@@ -1,0 +1,59 @@
+# ─── Secrets / env ─────────────────────────────────────────────
+# .env is the single source of live secrets — never commit it.
+.env
+.env.*
+!.env.example
+
+# ─── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv*/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ─── Databases (local dev) ─────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+test.db
+
+# ─── Node / frontend ───────────────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+.vite/
+
+# ─── Testing / coverage ────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/
+
+# ─── Editors / IDEs ────────────────────────────────────────────
+.vscode/
+.idea/
+.zcode/
+.git_disabled/
+*.swp
+*.swo
+*~
+
+# ─── OS files ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── App runtime / uploads ─────────────────────────────────────
+/tmp/
+uploads/
+*.log
