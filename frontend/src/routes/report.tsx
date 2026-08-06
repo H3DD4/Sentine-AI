@@ -24,11 +24,19 @@ import {
   downloadReport,
   generateReport,
   listFindings,
+  listReportTemplates,
   listReports,
   REPORT_HANDOFF_STORAGE_KEY,
   updateFinding,
 } from "@/lib/api";
-import type { ConversationReportHandoff, Finding, GeneratedReport, Verdict } from "@/lib/api";
+import type {
+  ConversationReportHandoff,
+  Finding,
+  GeneratedReport,
+  ReportSection,
+  ReportTemplate,
+  Verdict,
+} from "@/lib/api";
 import { ListSkeleton } from "@/components/ui/loading-skeletons";
 import { toast } from "sonner";
 import {
@@ -68,6 +76,34 @@ function suggestedTarget(handoff: ConversationReportHandoff | null): string {
   return source.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b/i)?.[0] ?? "";
 }
 
+function findingReportGaps(finding: Finding): string[] {
+  return [
+    ["description", finding.description],
+    ["affected scope", finding.affected_scope],
+    ["technical evidence", finding.technical_evidence],
+    ["impact", finding.impact],
+    ["severity", finding.severity],
+    ["analyst verdict", finding.verdict],
+  ]
+    .filter(([, value]) => !value || !String(value).trim())
+    .map(([label]) => String(label));
+}
+
+function draftReportGaps(handoff: ConversationReportHandoff | null): string[] {
+  if (!handoff) return [];
+  const draft = handoff.readiness.draft;
+  return [
+    ["description", draft.description],
+    ["affected scope", draft.affected_scope],
+    ["technical evidence", draft.technical_evidence],
+    ["impact", draft.impact],
+    ["severity", draft.severity],
+    ["analyst verdict", draft.verdict],
+  ]
+    .filter(([, value]) => !value || !String(value).trim())
+    .map(([label]) => String(label));
+}
+
 function ReportPage() {
   const queryClient = useQueryClient();
   const [conversationHandoff, setConversationHandoff] = useState<ConversationReportHandoff | null>(
@@ -89,6 +125,23 @@ function ReportPage() {
   const [findingTitle, setFindingTitle] = useState("");
   const [findingDescription, setFindingDescription] = useState("");
   const [findingVerdict, setFindingVerdict] = useState<Verdict | "pending">("pending");
+  const [findingScope, setFindingScope] = useState("");
+  const [findingEvidence, setFindingEvidence] = useState("");
+  const [findingReproduction, setFindingReproduction] = useState("");
+  const [findingImpact, setFindingImpact] = useState("");
+  const [findingSeverity, setFindingSeverity] = useState("");
+  const [findingCvssScore, setFindingCvssScore] = useState("");
+  const [findingCvssVector, setFindingCvssVector] = useState("");
+  const [templateId, setTemplateId] = useState("builtin");
+  const [selectedSections, setSelectedSections] = useState<ReportSection[]>([
+    "executive_summary",
+    "scope_methodology",
+    "findings_overview",
+    "detailed_findings",
+    "attack_mapping",
+    "evidence_gaps",
+    "disclaimer",
+  ]);
 
   useEffect(() => {
     const handoff = loadConversationHandoff();
@@ -110,6 +163,10 @@ function ReportPage() {
     queryKey: ["reports"],
     queryFn: listReports,
   });
+  const { data: templates = [] } = useQuery<ReportTemplate[]>({
+    queryKey: ["report-templates"],
+    queryFn: listReportTemplates,
+  });
 
   // Report generation mutation
   const reportMutation = useMutation({
@@ -119,6 +176,8 @@ function ReportPage() {
         engagement_title: engagementTitle.trim(),
         client_name: clientName.trim(),
         draft: includeConversationDraft ? conversationHandoff?.readiness.draft : undefined,
+        template_id: templateId === "builtin" ? undefined : templateId,
+        sections: selectedSections,
       });
       // Trigger download
       const url = URL.createObjectURL(blob);
@@ -160,13 +219,35 @@ function ReportPage() {
           title,
           description,
           verdict: findingVerdict === "pending" ? null : findingVerdict,
+          affected_scope: findingScope,
+          technical_evidence: findingEvidence,
+          reproduction_steps: findingReproduction
+            .split("\n")
+            .map((s) => s.trim())
+            .filter(Boolean),
+          impact: findingImpact,
+          severity: findingSeverity,
+          cvss_score: findingCvssScore ? Number(findingCvssScore) : null,
+          cvss_vector: findingCvssVector,
         });
       }
       return createFinding(title, description);
     },
     onSuccess: async (finding) => {
-      if (!editingFinding && findingVerdict !== "pending") {
-        await updateFinding(finding.id, { verdict: findingVerdict });
+      if (!editingFinding) {
+        await updateFinding(finding.id, {
+          verdict: findingVerdict === "pending" ? null : findingVerdict,
+          affected_scope: findingScope,
+          technical_evidence: findingEvidence,
+          reproduction_steps: findingReproduction
+            .split("\n")
+            .map((s) => s.trim())
+            .filter(Boolean),
+          impact: findingImpact,
+          severity: findingSeverity,
+          cvss_score: findingCvssScore ? Number(findingCvssScore) : null,
+          cvss_vector: findingCvssVector,
+        });
       }
       queryClient.invalidateQueries({ queryKey: ["findings"] });
       setEditingFinding(undefined);
@@ -199,6 +280,13 @@ function ReportPage() {
     setFindingTitle(finding?.title ?? "");
     setFindingDescription(finding?.description ?? "");
     setFindingVerdict(finding?.verdict ?? "pending");
+    setFindingScope(finding?.affected_scope ?? "");
+    setFindingEvidence(finding?.technical_evidence ?? "");
+    setFindingReproduction(finding?.reproduction_steps?.join("\n") ?? "");
+    setFindingImpact(finding?.impact ?? "");
+    setFindingSeverity(finding?.severity ?? "");
+    setFindingCvssScore(finding?.cvss_score?.toString() ?? "");
+    setFindingCvssVector(finding?.cvss_vector ?? "");
   };
 
   const downloadHistoricalReport = async (report: GeneratedReport) => {
@@ -232,10 +320,17 @@ function ReportPage() {
         finding.description.toLowerCase().includes(searchTerm)),
   );
   const reportItemCount = selectedFindingIds.length + (includeConversationDraft ? 1 : 0);
+  const incompleteSelected = findings
+    .filter((finding) => selectedFindingIds.includes(finding.id))
+    .filter((finding) => findingReportGaps(finding).length > 0);
+  const draftGaps = includeConversationDraft ? draftReportGaps(conversationHandoff) : [];
+  const draftIncomplete = draftGaps.length > 0;
   const missingRequirements = [
     !clientName.trim() ? "client or target" : null,
     !engagementTitle.trim() ? "engagement title" : null,
     reportItemCount === 0 ? "at least one selected finding" : null,
+    selectedSections.length === 0 ? "at least one report section" : null,
+    incompleteSelected.length > 0 || draftIncomplete ? "complete report content" : null,
   ].filter((item): item is string => Boolean(item));
   const canGenerate = missingRequirements.length === 0;
 
@@ -249,14 +344,14 @@ function ReportPage() {
     }
     reportMutation.mutate();
   };
-  const sections = [
-    { name: "Executive Summary", count: "auto" },
-    { name: "Scope & Methodology", count: "auto" },
-    { name: "Findings Overview", count: `${reportItemCount} selected` },
-    { name: "Detailed Findings", count: `${reportItemCount} selected` },
-    { name: "MITRE ATT&CK Mapping", count: "auto" },
-    { name: "Evidence Completeness", count: "auto" },
-    { name: "Appendices & Evidence", count: "auto" },
+  const sections: Array<{ id: ReportSection; name: string; count: string }> = [
+    { id: "executive_summary", name: "Executive Summary", count: "auto" },
+    { id: "scope_methodology", name: "Scope & Methodology", count: "auto" },
+    { id: "findings_overview", name: "Findings Overview", count: `${reportItemCount} selected` },
+    { id: "detailed_findings", name: "Detailed Findings", count: `${reportItemCount} selected` },
+    { id: "attack_mapping", name: "MITRE ATT&CK Mapping", count: "per finding" },
+    { id: "evidence_gaps", name: "Evidence Gaps", count: "per finding" },
+    { id: "disclaimer", name: "Disclaimer", count: "standard" },
   ];
 
   return (
@@ -345,6 +440,11 @@ function ReportPage() {
                     {conversationHandoff.readiness.missing.join(", ")}. You can generate now or
                     return to Analysis to strengthen these sections.
                   </span>
+                </div>
+              )}
+              {includeConversationDraft && draftGaps.length > 0 && (
+                <div className="mt-3 border border-sev-critical/30 bg-sev-critical/5 p-3 text-xs text-sev-critical">
+                  Client export is blocked until these fields are complete: {draftGaps.join(", ")}.
                 </div>
               )}
             </div>
@@ -455,6 +555,9 @@ function ReportPage() {
                   <span className="shrink-0 text-[10px] text-muted-foreground">
                     {f.verdict || "pending"}
                   </span>
+                  {findingReportGaps(f).length > 0 && (
+                    <span className="shrink-0 text-[10px] text-sev-medium">Incomplete</span>
+                  )}
                   <button onClick={() => openFindingEditor(f)} aria-label={`Edit ${f.title}`}>
                     <Pencil className="h-3.5 w-3.5 text-muted-foreground hover:text-foreground" />
                   </button>
@@ -481,6 +584,55 @@ function ReportPage() {
               <span className="text-xs text-muted-foreground">
                 Word document — open and edit before sending to the client.
               </span>
+            </div>
+          </div>
+
+          <div>
+            <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Report template
+            </Label>
+            <Select value={templateId} onValueChange={setTemplateId}>
+              <SelectTrigger className="mt-2">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="builtin">Built-in report layout</SelectItem>
+                {templates.map((template) => (
+                  <SelectItem key={template.id} value={template.id}>
+                    {template.name}
+                    {template.is_active ? " (active)" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div>
+            <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Report sections
+            </Label>
+            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+              {sections.map((section) => (
+                <label
+                  key={section.id}
+                  className="flex items-start gap-2 border border-border p-2.5"
+                >
+                  <Checkbox
+                    checked={selectedSections.includes(section.id)}
+                    onCheckedChange={(checked) =>
+                      setSelectedSections((current) =>
+                        checked === true
+                          ? [...new Set([...current, section.id])]
+                          : current.filter((id) => id !== section.id),
+                      )
+                    }
+                  />
+                  <span className="min-w-0 text-xs">
+                    <span className="block font-medium">{section.name}</span>
+                    <span className="text-muted-foreground">{section.count}</span>
+                  </span>
+                </label>
+              ))}
             </div>
           </div>
 
@@ -554,18 +706,22 @@ function ReportPage() {
               </div>
             </div>
             <ol className="divide-y divide-border">
-              {sections.map((s, i) => (
-                <li key={s.name} className="flex items-center gap-3 px-4 py-3">
-                  <div className="flex h-6 w-6 items-center justify-center bg-brand-cyan-soft text-xs font-semibold tabular-nums text-brand-navy">
-                    {String(i + 1).padStart(2, "0")}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium">{s.name}</div>
-                    <div className="text-[11px] tabular-nums text-muted-foreground">{s.count}</div>
-                  </div>
-                  <CheckCircle2 className="h-4 w-4 text-verdict-confirmed" />
-                </li>
-              ))}
+              {sections
+                .filter((section) => selectedSections.includes(section.id))
+                .map((s, i) => (
+                  <li key={s.name} className="flex items-center gap-3 px-4 py-3">
+                    <div className="flex h-6 w-6 items-center justify-center bg-brand-cyan-soft text-xs font-semibold tabular-nums text-brand-navy">
+                      {String(i + 1).padStart(2, "0")}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium">{s.name}</div>
+                      <div className="text-[11px] tabular-nums text-muted-foreground">
+                        {s.count}
+                      </div>
+                    </div>
+                    <CheckCircle2 className="h-4 w-4 text-verdict-confirmed" />
+                  </li>
+                ))}
             </ol>
           </div>
 
@@ -634,7 +790,7 @@ function ReportPage() {
         open={editingFinding !== undefined}
         onOpenChange={(open) => !open && setEditingFinding(undefined)}
       >
-        <DialogContent>
+        <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>{editingFinding ? "Edit finding" : "Add finding"}</DialogTitle>
           </DialogHeader>
@@ -645,11 +801,62 @@ function ReportPage() {
                 onChange={(event) => setFindingTitle(event.target.value)}
               />
             </Field>
-            <Field label="Description and evidence">
+            <Field label="Description">
               <Textarea
                 value={findingDescription}
                 onChange={(event) => setFindingDescription(event.target.value)}
                 rows={8}
+              />
+            </Field>
+            <Field label="Affected scope">
+              <Textarea
+                value={findingScope}
+                onChange={(event) => setFindingScope(event.target.value)}
+                rows={3}
+              />
+            </Field>
+            <Field label="Technical evidence">
+              <Textarea
+                value={findingEvidence}
+                onChange={(event) => setFindingEvidence(event.target.value)}
+                rows={5}
+              />
+            </Field>
+            <Field label="Reproduction steps (one per line)">
+              <Textarea
+                value={findingReproduction}
+                onChange={(event) => setFindingReproduction(event.target.value)}
+                rows={5}
+              />
+            </Field>
+            <Field label="Impact">
+              <Textarea
+                value={findingImpact}
+                onChange={(event) => setFindingImpact(event.target.value)}
+                rows={4}
+              />
+            </Field>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Severity">
+                <Input
+                  value={findingSeverity}
+                  onChange={(event) => setFindingSeverity(event.target.value)}
+                  placeholder="High"
+                />
+              </Field>
+              <Field label="CVSS score">
+                <Input
+                  value={findingCvssScore}
+                  onChange={(event) => setFindingCvssScore(event.target.value)}
+                  placeholder="8.1"
+                  inputMode="decimal"
+                />
+              </Field>
+            </div>
+            <Field label="CVSS vector">
+              <Input
+                value={findingCvssVector}
+                onChange={(event) => setFindingCvssVector(event.target.value)}
               />
             </Field>
             <Field label="Verdict">

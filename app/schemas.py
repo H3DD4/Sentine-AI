@@ -82,6 +82,13 @@ class FindingCreate(BaseModel):
     verdict: Optional[VerdictEnum] = None
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
+    affected_scope: str = ""
+    technical_evidence: str = ""
+    reproduction_steps: List[str] = []
+    impact: str = ""
+    severity: str = ""
+    cvss_score: Optional[float] = None
+    cvss_vector: str = ""
     matched_cves: List[str] = []
     matched_techniques: List[str] = []
     missing_evidence: List[str] = []
@@ -95,6 +102,13 @@ class FindingUpdate(BaseModel):
     verdict: Optional[VerdictEnum] = None
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
+    affected_scope: Optional[str] = None
+    technical_evidence: Optional[str] = None
+    reproduction_steps: Optional[List[str]] = None
+    impact: Optional[str] = None
+    severity: Optional[str] = None
+    cvss_score: Optional[float] = None
+    cvss_vector: Optional[str] = None
     matched_cves: Optional[List[str]] = None
     matched_techniques: Optional[List[str]] = None
     missing_evidence: Optional[List[str]] = None
@@ -123,6 +137,13 @@ class FindingOut(BaseModel):
     verdict: Optional[VerdictEnum] = None
     confidence: Optional[float] = None
     reasoning: Optional[str] = None
+    affected_scope: Optional[str] = None
+    technical_evidence: Optional[str] = None
+    reproduction_steps: List[str] = []
+    impact: Optional[str] = None
+    severity: Optional[str] = None
+    cvss_score: Optional[float] = None
+    cvss_vector: Optional[str] = None
     matched_cves: List[str] = []
     matched_techniques: List[str] = []
     missing_evidence: List[str] = []
@@ -192,6 +213,24 @@ class ReportRequest(BaseModel):
     engagement_title: str
     client_name: str
     draft: Optional[ReportDraft] = None
+    template_id: Optional[str] = None
+    sections: List[Literal[
+        "executive_summary",
+        "scope_methodology",
+        "findings_overview",
+        "detailed_findings",
+        "attack_mapping",
+        "evidence_gaps",
+        "disclaimer",
+    ]] = [
+        "executive_summary",
+        "scope_methodology",
+        "findings_overview",
+        "detailed_findings",
+        "attack_mapping",
+        "evidence_gaps",
+        "disclaimer",
+    ]
 
     @field_validator("engagement_title", "client_name")
     @classmethod
@@ -209,6 +248,17 @@ class GeneratedReportOut(BaseModel):
     filename: str
     finding_snapshot: List[dict] = []
     draft_snapshot: Optional[dict] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReportTemplateOut(BaseModel):
+    id: str
+    name: str
+    size_bytes: int
+    is_active: bool
     created_at: datetime
 
     class Config:

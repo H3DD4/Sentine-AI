@@ -43,6 +43,13 @@ export interface Finding {
   verdict: Verdict | null;
   confidence: number | null;
   reasoning: string | null;
+  affected_scope: string | null;
+  technical_evidence: string | null;
+  reproduction_steps: string[];
+  impact: string | null;
+  severity: string | null;
+  cvss_score: number | null;
+  cvss_vector: string | null;
   matched_cves: string[];
   matched_techniques: string[];
   missing_evidence: string[];
@@ -53,8 +60,6 @@ export interface Finding {
   created_at: string | null;
   updated_at: string | null;
   evidence: Evidence[];
-  // Derived on frontend from verdict
-  severity?: Severity;
 }
 
 export interface Engagement {
@@ -286,6 +291,25 @@ export interface ReportRequest {
   engagement_title: string;
   client_name: string;
   draft?: ReportDraft;
+  template_id?: string;
+  sections: ReportSection[];
+}
+
+export type ReportSection =
+  | "executive_summary"
+  | "scope_methodology"
+  | "findings_overview"
+  | "detailed_findings"
+  | "attack_mapping"
+  | "evidence_gaps"
+  | "disclaimer";
+
+export interface ReportTemplate {
+  id: string;
+  name: string;
+  size_bytes: number;
+  is_active: boolean;
+  created_at: string;
 }
 
 export interface GeneratedReport {
@@ -569,6 +593,13 @@ export async function updateFinding(
       | "recommended_next_steps"
       | "analyst_confirmed"
       | "engagement_id"
+      | "affected_scope"
+      | "technical_evidence"
+      | "reproduction_steps"
+      | "impact"
+      | "severity"
+      | "cvss_score"
+      | "cvss_vector"
     >
   >,
 ): Promise<Finding> {
@@ -694,6 +725,24 @@ export async function generateReport(requestData: ReportRequest): Promise<Blob> 
 
 export async function listReports(): Promise<GeneratedReport[]> {
   return request<GeneratedReport[]>("GET", "/reports");
+}
+
+export async function listReportTemplates(): Promise<ReportTemplate[]> {
+  return request<ReportTemplate[]>("GET", "/reports/templates");
+}
+
+export async function uploadReportTemplate(file: File): Promise<ReportTemplate> {
+  const form = new FormData();
+  form.append("file", file);
+  return request<ReportTemplate>("POST", "/reports/templates", form);
+}
+
+export async function activateReportTemplate(id: string): Promise<ReportTemplate> {
+  return request<ReportTemplate>("POST", `/reports/templates/${id}/activate`);
+}
+
+export async function deleteReportTemplate(id: string): Promise<void> {
+  return request<void>("DELETE", `/reports/templates/${id}`);
 }
 
 export async function downloadReport(id: string): Promise<Blob> {

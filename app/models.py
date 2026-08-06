@@ -34,6 +34,13 @@ class Finding(Base):
     verdict = Column(SAEnum(VerdictEnum), nullable=True)
     confidence = Column(Float, nullable=True)
     reasoning = Column(Text, nullable=True)
+    affected_scope = Column(Text, nullable=True)
+    technical_evidence = Column(Text, nullable=True)
+    reproduction_steps = Column(JSON, default=list, nullable=False)
+    impact = Column(Text, nullable=True)
+    severity = Column(String, nullable=True)
+    cvss_score = Column(Float, nullable=True)
+    cvss_vector = Column(String, nullable=True)
     matched_cves = Column(JSON, default=list)
     matched_techniques = Column(JSON, default=list)
     missing_evidence = Column(JSON, default=list)
@@ -97,4 +104,14 @@ class GeneratedReport(Base):
     storage_path = Column(String, nullable=False)
     finding_snapshot = Column(JSON, default=list, nullable=False)
     draft_snapshot = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ReportTemplate(Base):
+    __tablename__ = "report_templates"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    storage_path = Column(String, nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    is_active = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

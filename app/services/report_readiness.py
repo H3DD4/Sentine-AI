@@ -234,16 +234,20 @@ def draft_to_finding(draft: ReportDraft) -> Finding:
     verdict = FindingVerdict(draft.verdict.value) if draft.verdict else None
     finding = Finding(
         title=draft.title or "Conversation finding",
-        description="\n\n".join(part for part in details if part),
+        description=draft.description,
         verdict=verdict,
         confidence=draft.confidence,
         reasoning=draft.impact or draft.description,
+        affected_scope=draft.affected_scope,
+        technical_evidence=draft.technical_evidence,
+        reproduction_steps=draft.reproduction_steps,
+        impact=draft.impact,
+        severity=draft.severity,
+        cvss_score=draft.cvss_score,
+        cvss_vector=draft.cvss_vector,
         matched_cves=draft.matched_cves,
         matched_techniques=draft.matched_techniques,
         missing_evidence=[],
         recommended_next_steps=draft.remediation,
     )
-    finding.severity = draft.severity
-    finding.cvss_score = draft.cvss_score
-    finding.cvss_vector = draft.cvss_vector
     return finding

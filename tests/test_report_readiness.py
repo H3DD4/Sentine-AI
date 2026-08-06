@@ -7,6 +7,7 @@ from docx import Document
 
 from app.schemas import ChatMessage, ReportDraft
 from app.services.report import generate_report_docx
+from app.routers.report import _missing_report_fields
 from app.kb.base import SearchOutcome
 from app.routers.chat import (
     _bounded_provider_messages,
@@ -268,6 +269,53 @@ class ReportReadinessTests(unittest.TestCase):
         self.assertNotIn("Write a 3-paragraph", report_text)
         self.assertNotIn("VerdictEnum.", report_text)
         self.assertNotIn("Recommendations", report_text)
+
+    def test_incomplete_finding_is_blocked_from_client_export(self):
+        finding = draft_to_finding(
+            ReportDraft(title="Command injection", description="Commands execute through host.")
+        )
+
+        gaps = _missing_report_fields(finding)
+
+        self.assertIn("technical evidence", gaps)
+        self.assertIn("impact", gaps)
+        self.assertIn("severity", gaps)
+        self.assertIn("analyst verdict", gaps)
+
+    def test_uploaded_template_is_used_and_placeholders_are_replaced(self):
+        template = Document()
+        paragraph = template.add_paragraph()
+        paragraph.add_run("{{CLIENT_")
+        paragraph.add_run("NAME}}")
+        paragraph.add_run(" / {{ENGAGEMENT_TITLE}}")
+        with __import__("tempfile").TemporaryDirectory() as directory:
+            path = __import__("pathlib").Path(directory) / "template.docx"
+            template.save(path)
+            draft = ReportDraft(
+                title="Command injection",
+                affected_scope="POST /ping",
+                description="The host parameter executes operating-system commands.",
+                technical_evidence="The response returned uid=33(www-data).",
+                impact="An attacker can execute commands on the host.",
+                severity="High",
+                verdict="confirmed",
+            )
+
+            content = asyncio.run(
+                generate_report_docx(
+                    [draft_to_finding(draft)],
+                    "External test",
+                    "Northwind",
+                    template_path=str(path),
+                    sections={"detailed_findings"},
+                )
+            )
+
+        document = Document(io.BytesIO(content))
+        report_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        self.assertIn("Northwind / External test", report_text)
+        self.assertNotIn("{{CLIENT_NAME}}", report_text)
+        self.assertNotIn("Executive Summary", report_text)
 
 
 if __name__ == "__main__":

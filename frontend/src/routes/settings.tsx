@@ -13,9 +13,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { getSettings, updateSettings } from "@/lib/api";
-import type { Settings } from "@/lib/api";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  activateReportTemplate,
+  deleteReportTemplate,
+  getSettings,
+  listReportTemplates,
+  updateSettings,
+  uploadReportTemplate,
+} from "@/lib/api";
+import type { ReportTemplate, Settings } from "@/lib/api";
 import { FormSkeleton } from "@/components/ui/loading-skeletons";
 import { toast } from "sonner";
 import { Upload, Cpu, FileText, Check, Save, Globe, Bot, Server, Sparkles } from "lucide-react";
@@ -82,11 +89,24 @@ function SettingsPage() {
   const [autoValidate, setAutoValidate] = useState(true);
   const [autoMitre, setAutoMitre] = useState(true);
   const [anonymize, setAnonymize] = useState(true);
+  const queryClient = useQueryClient();
 
   const { data: settingsData, isLoading: settingsLoading } = useQuery<Settings>({
     queryKey: ["settings"],
     queryFn: getSettings,
     refetchInterval: 30_000,
+  });
+  const { data: templates = [] } = useQuery<ReportTemplate[]>({
+    queryKey: ["report-templates"],
+    queryFn: listReportTemplates,
+  });
+  const templateMutation = useMutation({
+    mutationFn: uploadReportTemplate,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["report-templates"] });
+      toast.success("Report template uploaded");
+    },
+    onError: (error) => toast.error("Template upload failed", { description: error.message }),
   });
 
   useEffect(() => {
@@ -187,17 +207,28 @@ function SettingsPage() {
           </div>
 
           <label className="block cursor-pointer border border-dashed border-input p-7 text-center transition-colors hover:border-brand-cyan hover:bg-brand-cyan-soft">
-            <input type="file" className="hidden" accept=".docx,.pdf" />
+            <input
+              type="file"
+              className="hidden"
+              accept=".docx"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) templateMutation.mutate(file);
+                event.target.value = "";
+              }}
+            />
             <Upload className="h-6 w-6 mx-auto text-brand-cyan mb-2" />
             <div className="text-sm font-medium">Drop a .docx template or click to upload</div>
             <div className="mt-1 text-[11px] tabular-nums text-muted-foreground">Max 10 MB</div>
           </label>
 
           <div className="mt-4 space-y-2">
-            {[
-              { name: "FM-RedTeam-2026.docx", active: true, size: "142 KB" },
-              { name: "FM-Executive-Brief.docx", active: false, size: "88 KB" },
-            ].map((t) => (
+            {templates.length === 0 && (
+              <div className="border border-dashed border-border p-4 text-center text-xs text-muted-foreground">
+                No template uploaded. Reports will use the built-in plain layout.
+              </div>
+            )}
+            {templates.map((t) => (
               <div
                 key={t.name}
                 className="flex items-center justify-between border border-border bg-[#fafafa] px-3 py-2.5"
@@ -206,19 +237,40 @@ function SettingsPage() {
                   <FileText className="h-4 w-4 text-brand-cyan" />
                   <div>
                     <div className="text-sm font-medium">{t.name}</div>
-                    <div className="text-[11px] text-muted-foreground">{t.size}</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {(t.size_bytes / 1024).toFixed(1)} KB
+                    </div>
                   </div>
                 </div>
-                {t.active ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-verdict-confirmed">
-                    <Check className="h-3 w-3" />
-                    Active
-                  </span>
-                ) : (
-                  <Button variant="ghost" size="sm">
-                    Activate
+                <div className="flex items-center gap-2">
+                  {t.is_active ? (
+                    <span className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider text-verdict-confirmed">
+                      <Check className="h-3 w-3" />
+                      Active
+                    </span>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={async () => {
+                        await activateReportTemplate(t.id);
+                        queryClient.invalidateQueries({ queryKey: ["report-templates"] });
+                      }}
+                    >
+                      Activate
+                    </Button>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={async () => {
+                      await deleteReportTemplate(t.id);
+                      queryClient.invalidateQueries({ queryKey: ["report-templates"] });
+                    }}
+                  >
+                    Delete
                   </Button>
-                )}
+                </div>
               </div>
             ))}
           </div>

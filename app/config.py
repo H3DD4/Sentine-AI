@@ -120,6 +120,7 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:8003"]
     UPLOAD_DIR: str = "/tmp/redteam_evidence"
     REPORT_DIR: str = "/tmp/redteam_reports"
+    REPORT_TEMPLATE_DIR: str = "/tmp/redteam_report_templates"
     EVIDENCE_MAX_FILES: int = 20
     EVIDENCE_MAX_FILE_BYTES: int = 50 * 1024 * 1024
     EVIDENCE_MAX_TOTAL_BYTES: int = 100 * 1024 * 1024

@@ -88,6 +88,7 @@ async def lifespan(app: FastAPI):
     # 4. Ensure upload directory exists
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.REPORT_DIR, exist_ok=True)
+    os.makedirs(settings.REPORT_TEMPLATE_DIR, exist_ok=True)
 
     # 5. Start background KB sync scheduler
     scheduler = AsyncIOScheduler()
