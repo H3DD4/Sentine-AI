@@ -86,3 +86,15 @@ class Engagement(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     findings = relationship("Finding", back_populates="engagement")
+
+
+class GeneratedReport(Base):
+    __tablename__ = "generated_reports"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    client_name = Column(String, nullable=False)
+    engagement_title = Column(String, nullable=False)
+    filename = Column(String, nullable=False)
+    storage_path = Column(String, nullable=False)
+    finding_snapshot = Column(JSON, default=list, nullable=False)
+    draft_snapshot = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

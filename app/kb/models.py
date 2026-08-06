@@ -148,7 +148,53 @@ class MitreTechnique(Base, KBSyncMixin):
     deprecated = Column(Boolean, default=False, nullable=False, index=True)
 
 
-# ── Source 3: Ghostwriter (the firm's own historical findings) ────────────────
+# ── Source 3: OWASP Top 10 ───────────────────────────────────────────────────
+
+
+class OwaspTop10Entry(Base, KBSyncMixin):
+    """One canonical OWASP Top 10 category document."""
+
+    __tablename__ = "owasp_top10"
+
+    category_id = Column(String(16), primary_key=True)  # e.g. A03:2021
+    rank = Column(Integer, nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    name = Column(String(256), nullable=False, default="")
+    overview = Column(Text, nullable=False, default="")
+    description = Column(Text, nullable=False, default="")
+    prevention = Column(Text, nullable=True)
+    scenarios = Column(Text, nullable=True)
+    full_text = Column(Text, nullable=False, default="")
+    cwe_ids = Column(JSON, default=list, nullable=False)
+    ref_urls = Column(JSON, default=list, nullable=False)
+    source_url = Column(String(1024), nullable=False)
+
+
+# ── Source 4: Broader official OWASP documentation ───────────────────────────
+
+
+class OwaspDocument(Base, KBSyncMixin):
+    """One authoritative English Markdown document from an OWASP project."""
+
+    __tablename__ = "owasp_documents"
+
+    document_id = Column(String(64), primary_key=True)
+    project = Column(String(32), nullable=False, index=True)
+    repository = Column(String(128), nullable=False)
+    branch = Column(String(64), nullable=False)
+    version = Column(String(32), nullable=True, index=True)
+    path = Column(String(1024), nullable=False)
+    title = Column(String(512), nullable=False, default="")
+    body = Column(Text, nullable=False, default="")
+    git_sha = Column(String(40), nullable=False)
+    source_url = Column(String(1024), nullable=False)
+    cwe_ids = Column(JSON, default=list, nullable=False)
+    ref_urls = Column(JSON, default=list, nullable=False)
+
+    __table_args__ = (Index("ix_owasp_documents_project_path", "project", "path", unique=True),)
+
+
+# ── Source 5: Ghostwriter (the firm's own historical findings) ────────────────
 
 
 class GhostwriterFinding(Base, KBSyncMixin):
@@ -195,7 +241,7 @@ class GhostwriterFinding(Base, KBSyncMixin):
     gw_updated_at = Column(DateTime, nullable=True, index=True)
 
 
-# ── Source 4: Internal analyst knowledge ─────────────────────────────────────
+# ── Source 6: Internal analyst knowledge ─────────────────────────────────────
 
 
 class InternalDoc(Base, KBSyncMixin):

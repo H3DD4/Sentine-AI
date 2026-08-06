@@ -13,15 +13,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
 from app.kb.base import SearchOutcome
 from app.schemas import ChatRequest, ChatMessage, ValidationResult
-from app.services.retrieval import multimodal_search
+from app.services.retrieval import federated_search, multimodal_search
 from app.services.llm_client import AsyncLLMClient
 from app.services.validation import validate_finding
-from app.services.evidence import parse_evidence
+from app.services.upload_processing import (
+    cleanup_staged_evidence,
+    move_staged_evidence,
+    stage_evidence_uploads,
+)
 from app.services.report import generate_report_docx
 from app.models import Finding, Evidence, Engagement
 import json
 import io
 import logging
+import asyncio
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 log = logging.getLogger(__name__)
@@ -78,7 +83,31 @@ async def _conversation_outcome(
 ) -> SearchOutcome:
     if not _needs_retrieval(query):
         return SearchOutcome(query=query)
-    return await multimodal_search(query, session, evidence_texts=prior_turns)
+    retrieval_query = query
+    if prior_turns:
+        retrieval_query = f"{query}\n\nPrior finding context:\n{prior_turns[-1]}"
+    try:
+        return await asyncio.wait_for(
+            federated_search(retrieval_query, session),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Chat retrieval timed out; continuing without KB context")
+        return SearchOutcome(
+            query=query,
+            degraded=True,
+            notes=["knowledge retrieval timed out; the response is not grounded in the local KB"],
+        )
+    except Exception as exc:
+        log.exception("Chat retrieval failed; continuing without KB context")
+        return SearchOutcome(
+            query=query,
+            degraded=True,
+            notes=[
+                f"knowledge retrieval failed ({type(exc).__name__}); "
+                "the response is not grounded in the local KB"
+            ],
+        )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -109,7 +138,7 @@ def _build_messages_with_context(
     messages: list[ChatMessage], outcome: SearchOutcome
 ) -> list[dict]:
     """Inject KB context as a final system section, NOT appended to user text."""
-    out = [{"role": m.role, "content": m.content} for m in messages]
+    out = _bounded_provider_messages(messages)
 
     lines = []
     for hit in outcome.hits:
@@ -143,6 +172,32 @@ def _build_messages_with_context(
         })
 
     return out
+
+
+def _bounded_provider_messages(
+    messages: list[ChatMessage], *, max_messages: int = 24, max_chars: int = 48_000
+) -> list[dict]:
+    """Keep recent valid turns within a provider-safe context budget."""
+    selected: list[dict] = []
+    remaining = max_chars
+    for message in reversed(messages):
+        if message.role not in ("user", "assistant"):
+            continue
+        content = message.content
+        if not content.strip():
+            continue
+        if not selected and len(content) > remaining:
+            content = content[:remaining]
+        elif len(content) > remaining:
+            break
+        selected.append({"role": message.role, "content": content})
+        remaining -= len(content)
+        if len(selected) >= max_messages or remaining <= 0:
+            break
+    selected.reverse()
+    while selected and selected[0]["role"] == "assistant":
+        selected.pop(0)
+    return selected
 
 
 def _append_evidence_note(
@@ -345,32 +400,39 @@ async def chat_with_evidence(
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise HTTPException(400, f"Invalid messages payload: {exc}")
 
-    evidence_texts, image_descriptions, parsed_files = [], [], []
-    for upload in files:
-        file_bytes = await upload.read()
-        parsed = await parse_evidence(upload.filename or "unknown", file_bytes)
-        if parsed.get("extracted_text"):
-            evidence_texts.append(parsed["extracted_text"])
-        if parsed.get("image_description"):
-            image_descriptions.append(parsed["image_description"])
-        parsed_files.append(parsed)
+    parsed_files, processing = await stage_evidence_uploads(files)
+    evidence_texts = [p["analysis_text"] for p in parsed_files if p.get("analysis_text")]
+    image_descriptions = [
+        p["image_description"] for p in parsed_files if p["image_description"]
+    ]
 
     full_description = "\n".join(m.content for m in parsed_messages if m.role == "user")
 
     if action == "validate":
-        finding, result, outcome = await _run_validation(title, full_description, evidence_texts, image_descriptions, session)
+        try:
+            finding, result, outcome = await _run_validation(
+                title, full_description, evidence_texts, image_descriptions, session
+            )
+        except Exception:
+            cleanup_staged_evidence(parsed_files)
+            raise
 
-        for f in parsed_files:
-            session.add(Evidence(
-                finding_id=finding.id,
-                filename=f["filename"],
-                file_type=f["file_type"],
-                storage_path=f["storage_path"],
-                extracted_text=f.get("extracted_text"),
-                image_description=f.get("image_description"),
-            ))
-
-        await session.commit()
+        try:
+            move_staged_evidence(parsed_files, finding.id)
+            for f in parsed_files:
+                session.add(Evidence(
+                    finding_id=finding.id,
+                    filename=f["filename"],
+                    file_type=f["file_type"],
+                    storage_path=f["storage_path"],
+                    extracted_text=f.get("extracted_text"),
+                    image_description=f.get("image_description"),
+                ))
+            await session.commit()
+        except Exception:
+            cleanup_staged_evidence(parsed_files)
+            await session.rollback()
+            raise
         await session.refresh(finding)
         return {
             "response": _format_validation_message(result, outcome),
@@ -378,6 +440,7 @@ async def chat_with_evidence(
             "verdict": result.verdict,
             "confidence": result.confidence,
             **_provenance_payload(outcome),
+            "processing": processing,
         }
 
     # plain conversation with evidence attached, not validating yet
@@ -386,17 +449,28 @@ async def chat_with_evidence(
     # Uploaded evidence is searched as its own arm rather than being folded
     # into the question — a log excerpt and a question are different kinds of
     # text and embed to different places.
-    outcome = await multimodal_search(
-        query,
-        session,
-        evidence_texts=[*prior_turns, *evidence_texts],
-        image_descriptions=image_descriptions,
-    )
+    try:
+        outcome = await multimodal_search(
+            query,
+            session,
+            evidence_texts=[*prior_turns, *evidence_texts],
+            image_descriptions=image_descriptions,
+        )
+    except Exception:
+        cleanup_staged_evidence(parsed_files)
+        raise
     llm_messages = _build_messages_with_context(parsed_messages, outcome)
 
     client = AsyncLLMClient()
-    response = await client.generate(messages=llm_messages, system=CHAT_SYSTEM, max_tokens=1200)
-    return {"response": response, **_provenance_payload(outcome)}
+    try:
+        response = await client.generate(messages=llm_messages, system=CHAT_SYSTEM, max_tokens=1200)
+    finally:
+        cleanup_staged_evidence(parsed_files)
+    return {
+        "response": response,
+        **_provenance_payload(outcome),
+        "processing": processing,
+    }
 
 
 # ── Streaming endpoint (unchanged — pure conversation) ──────────────────────
@@ -418,11 +492,11 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
     that the CVE feed was down.
     """
     query, prior_turns = _retrieval_inputs(req.messages)
-    outcome = await _conversation_outcome(query, prior_turns, session)
     social_reply = _social_reply(query)
-    messages = _build_messages_with_context(req.messages, outcome)
 
     async def event_generator():
+        outcome = await _conversation_outcome(query, prior_turns, session)
+        messages = _build_messages_with_context(req.messages, outcome)
         yield f"data: {json.dumps(_provenance_payload(outcome))}\n\n"
 
         if social_reply:

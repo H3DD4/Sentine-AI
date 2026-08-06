@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 import logging
 from typing import Any
 
@@ -197,10 +198,13 @@ async def assess_conversation(messages: list[ChatMessage]) -> ReportReadinessRes
         f"{message.role.upper()}: {message.content[:6000]}" for message in admissible
     )[-50_000:]
     try:
-        data = await AsyncLLMClient().generate_validation(
-            system=EXTRACTION_SYSTEM,
-            user_message=f"CONVERSATION:\n{transcript}\n\nExtract the report draft.",
-            max_tokens=1600,
+        data = await asyncio.wait_for(
+            AsyncLLMClient().generate_validation(
+                system=EXTRACTION_SYSTEM,
+                user_message=f"CONVERSATION:\n{transcript}\n\nExtract the report draft.",
+                max_tokens=1600,
+            ),
+            timeout=55,
         )
         return score_report_draft(ReportDraft(**_normalize_extraction(data)))
     except Exception as exc:

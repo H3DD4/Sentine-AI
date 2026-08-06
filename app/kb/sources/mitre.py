@@ -28,6 +28,7 @@ class MitreSource(KBSource):
         """
         parts = [
             f"{row.technique_id} {row.name}",
+            f"ATT&CK version: {row.attack_version}" if row.attack_version else "",
             row.description or "",
         ]
         tactics = row.tactics or []
@@ -57,6 +58,7 @@ class MitreSource(KBSource):
             "is_subtechnique": bool(row.is_subtechnique),
             "parent_technique_id": row.parent_technique_id or "",
             "ref_urls": (row.ref_urls or [])[:5],
+            "attack_version": row.attack_version,
             "deprecated": bool(row.deprecated),
         }
 
@@ -79,6 +81,7 @@ class MitreSource(KBSource):
                 "platforms": payload.get("platforms") or [],
                 "detection": payload.get("detection") or "",
                 "data_sources": payload.get("data_sources") or [],
+                "attack_version": payload.get("attack_version"),
                 "mitre_techniques": [tid] if tid else [],
             },
         )

@@ -110,7 +110,8 @@ def _condense(text: str, limit: int) -> str:
         lines.append(line.strip())
     condensed = "\n".join(lines)
     if len(condensed) > limit:
-        condensed = condensed[:limit].rsplit("\n", 1)[0] or condensed[:limit]
+        head = limit * 2 // 3
+        condensed = condensed[:head] + "\n" + condensed[-(limit - head):]
     return condensed
 
 
@@ -161,14 +162,19 @@ def plan_queries(
             )
         )
 
-    for text in evidence_texts:
+    remaining = max(0, MAX_QUERIES - len(queries))
+    evidence_slots = min(len(evidence_texts), remaining)
+    selected_evidence = _evenly_select(evidence_texts, evidence_slots)
+    remaining -= evidence_slots
+
+    for text in selected_evidence:
         condensed = _condense(text, EVIDENCE_CHARS)
         if condensed:
             queries.append(
                 PlannedQuery(text=condensed, weight=WEIGHT_EVIDENCE, modality="evidence")
             )
 
-    for text in image_descriptions:
+    for text in _evenly_select(image_descriptions, remaining):
         condensed = _condense(text, EVIDENCE_CHARS)
         if condensed:
             queries.append(
@@ -190,6 +196,19 @@ def plan_queries(
         deduped.append(q)
 
     return deduped[:MAX_QUERIES]
+
+
+def _evenly_select(values: Sequence[str], count: int) -> list[str]:
+    """Select across the whole sequence so later files are not silently ignored."""
+    values = [value for value in values if value and value.strip()]
+    if count <= 0:
+        return []
+    if len(values) <= count:
+        return values
+    if count == 1:
+        return [values[0]]
+    indexes = [round(i * (len(values) - 1) / (count - 1)) for i in range(count)]
+    return [values[index] for index in indexes]
 
 
 def fuse_outcomes(

@@ -80,6 +80,16 @@ _SOURCE_INDEXES: dict[str, dict[str, PayloadSchemaType]] = {
         "platforms": PayloadSchemaType.KEYWORD,
         "deprecated": PayloadSchemaType.BOOL,
     },
+    "owasp": {
+        "rank": PayloadSchemaType.INTEGER,
+        "year": PayloadSchemaType.INTEGER,
+        "cwe_ids": PayloadSchemaType.KEYWORD,
+    },
+    "owasp_docs": {
+        "project": PayloadSchemaType.KEYWORD,
+        "version": PayloadSchemaType.KEYWORD,
+        "cwe_ids": PayloadSchemaType.KEYWORD,
+    },
     "ghostwriter": {
         "severity": PayloadSchemaType.KEYWORD,
         "finding_type": PayloadSchemaType.KEYWORD,

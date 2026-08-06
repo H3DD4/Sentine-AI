@@ -100,7 +100,11 @@ class Settings(BaseSettings):
     NVD_BASE_URL: str = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
     # MITRE ATT&CK
-    MITRE_STIX_URL: str = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
+    MITRE_STIX_URL: str = "https://github.com/mitre-attack/attack-stix-data/releases/latest/download/enterprise-attack.json"
+
+    # OWASP Top 10 (official project repository). The sync discovers the latest
+    # published numeric release below this repository root.
+    OWASP_TOP10_CONTENTS_URL: str = "https://api.github.com/repos/OWASP/Top10/contents"
 
     # Ghostwriter
     GHOSTWRITER_URL: str = ""
@@ -115,6 +119,11 @@ class Settings(BaseSettings):
     API_KEY: str = "change-me"
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:8003"]
     UPLOAD_DIR: str = "/tmp/redteam_evidence"
+    REPORT_DIR: str = "/tmp/redteam_reports"
+    EVIDENCE_MAX_FILES: int = 20
+    EVIDENCE_MAX_FILE_BYTES: int = 50 * 1024 * 1024
+    EVIDENCE_MAX_TOTAL_BYTES: int = 100 * 1024 * 1024
+    EVIDENCE_UPLOAD_CHUNK_BYTES: int = 1024 * 1024
 
     class Config:
         env_file = ".env"

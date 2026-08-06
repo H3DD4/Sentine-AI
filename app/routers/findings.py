@@ -9,7 +9,7 @@ Changes:
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 from app.db import get_session
 from app.models import Finding, Evidence
@@ -23,10 +23,15 @@ router = APIRouter(prefix="/findings", tags=["findings"])
 async def list_findings(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
+    search: str = Query(""),
     session: AsyncSession = Depends(get_session),
 ):
+    query = select(Finding)
+    if search.strip():
+        term = f"%{search.strip()}%"
+        query = query.where(or_(Finding.title.ilike(term), Finding.description.ilike(term)))
     result = await session.execute(
-        select(Finding)
+        query
         .options(selectinload(Finding.evidence))
         .order_by(Finding.created_at.desc())
         .offset(skip)
@@ -57,10 +62,7 @@ async def create_finding(
     session: AsyncSession = Depends(get_session),
 ):
     """Create a new finding manually (without running validation)."""
-    finding = Finding(
-        title=data.title,
-        description=data.description,
-    )
+    finding = Finding(**data.model_dump())
     session.add(finding)
     await session.commit()
     result = await session.execute(
@@ -77,7 +79,7 @@ async def update_finding(
     update: FindingUpdate,
     session: AsyncSession = Depends(get_session),
 ):
-    """Analyst confirmation for false_positive / insufficient verdicts."""
+    """Update analyst-owned finding fields."""
     result = await session.execute(
         select(Finding)
         .options(selectinload(Finding.evidence))
@@ -86,8 +88,8 @@ async def update_finding(
     finding = result.scalar_one_or_none()
     if not finding:
         raise HTTPException(404, "Finding not found")
-    if update.analyst_confirmed is not None:
-        finding.analyst_confirmed = update.analyst_confirmed
+    for field, value in update.model_dump(exclude_unset=True).items():
+        setattr(finding, field, value)
     await session.commit()
     result = await session.execute(
         select(Finding)

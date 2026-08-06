@@ -261,14 +261,18 @@ def _hybrid_query_sync(
 
 
 def _exact_id_query_sync(
-    qdrant: QdrantClient, source: KBSource, doc_ids: list[str]
+    qdrant: QdrantClient,
+    source: KBSource,
+    doc_ids: list[str],
+    qfilter: Optional[Filter],
 ) -> list[Any]:
     """Direct payload lookup for identifiers found verbatim in the query."""
+    must = [FieldCondition(key="doc_id", match=MatchAny(any=doc_ids))]
+    if qfilter:
+        must.extend(qfilter.must or [])
     res = qdrant.query_points(
         collection_name=source.collection,
-        query_filter=Filter(
-            must=[FieldCondition(key="doc_id", match=MatchAny(any=doc_ids))]
-        ),
+        query_filter=Filter(must=must),
         limit=len(doc_ids) * 4,  # a doc may have several chunks
         with_payload=True,
     )
@@ -344,7 +348,13 @@ async def _search_one_source(
         ]
         if exact_ids:
             tasks.append(
-                asyncio.to_thread(_exact_id_query_sync, qdrant, source, exact_ids)
+                asyncio.to_thread(
+                    _exact_id_query_sync,
+                    qdrant,
+                    source,
+                    exact_ids,
+                    _build_filter(source, cvss_min, payload_filter),
+                )
             )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -540,7 +550,7 @@ async def federated_search(
 
     fused = _weighted_rrf(per_source)
 
-    if rerank and fused:
+    if rerank and settings.RERANK_ENABLED and fused:
         fused = await asyncio.to_thread(_rerank_sync, query, fused[:RERANK_CANDIDATES])
         # Checked *after* the attempt, since the loader resolves lazily on
         # first use — asking before this point would always report "fine".

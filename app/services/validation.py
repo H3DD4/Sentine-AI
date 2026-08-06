@@ -29,6 +29,11 @@ from app.services.retrieval import multimodal_search
 
 log = logging.getLogger(__name__)
 
+DESCRIPTION_CONTEXT_CHARS = 24_000
+EVIDENCE_CONTEXT_CHARS = 24_000
+IMAGE_CONTEXT_CHARS = 8_000
+KB_CONTEXT_CHARS = 16_000
+
 VALIDATION_SYSTEM = """You are a senior red team analyst and security researcher at Forvis Mazars.
 Your job is to validate whether a reported penetration testing finding is a confirmed vulnerability,
 a likely issue, insufficient to confirm, or a false positive.
@@ -126,6 +131,27 @@ def build_context_block(outcome: SearchOutcome) -> str:
     return "\n\n".join(blocks)
 
 
+def _representative_text(text: str, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    head = limit * 2 // 3
+    tail = limit - head
+    return text[:head] + "\n\n[... middle omitted from model context ...]\n\n" + text[-tail:], True
+
+
+def _bounded_items(items: list[str], budget: int) -> tuple[list[str], bool]:
+    if not items:
+        return [], False
+    per_item = max(1, budget // len(items))
+    selected = []
+    truncated = False
+    for item in items:
+        excerpt, was_truncated = _representative_text(item, per_item)
+        selected.append(excerpt)
+        truncated = truncated or was_truncated
+    return selected, truncated
+
+
 async def validate_finding(
     finding_description: str,
     evidence_texts: list[str],
@@ -149,20 +175,37 @@ async def validate_finding(
     )
 
     # 2. Build the context and coverage blocks.
-    kb_context = build_context_block(outcome)
+    kb_context, kb_truncated = _representative_text(
+        build_context_block(outcome), KB_CONTEXT_CHARS
+    )
+
+    finding_context, finding_truncated = _representative_text(
+        finding_description, DESCRIPTION_CONTEXT_CHARS
+    )
+    selected_evidence, evidence_truncated = _bounded_items(
+        evidence_texts, EVIDENCE_CONTEXT_CHARS
+    )
+    selected_images, images_truncated = _bounded_items(
+        image_descriptions, IMAGE_CONTEXT_CHARS
+    )
+    if finding_truncated or evidence_truncated or images_truncated or kb_truncated:
+        outcome.notes.append(
+            "validation used representative bounded excerpts; complete submitted text and artifacts "
+            "remain stored where persistence was requested"
+        )
 
     # 3. Build the evidence block.
     evidence_block = ""
-    if evidence_texts:
+    if selected_evidence:
         evidence_block += "\n\n=== TEXT/LOG EVIDENCE ===\n"
-        evidence_block += "\n---\n".join(evidence_texts[:5])
+        evidence_block += "\n---\n".join(selected_evidence)
 
-    if image_descriptions:
+    if selected_images:
         evidence_block += "\n\n=== SCREENSHOT/IMAGE EVIDENCE (vision-extracted) ===\n"
-        evidence_block += "\n---\n".join(image_descriptions)
+        evidence_block += "\n---\n".join(selected_images)
 
     user_message = f"""FINDING TO VALIDATE:
-{finding_description}
+{finding_context}
 {evidence_block}
 
 === DATA COVERAGE ===

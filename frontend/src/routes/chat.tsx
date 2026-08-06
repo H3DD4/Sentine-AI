@@ -124,7 +124,8 @@ function MarkdownText({ text }: { text: string }) {
 
 function ChatPage() {
   const navigate = useNavigate();
-  const [messages, setMessages] = useState<Msg[]>(loadStoredMessages);
+  const [messages, setMessages] = useState<Msg[]>([]);
+  const [storageLoaded, setStorageLoaded] = useState(false);
   const [input, setInput] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
@@ -139,6 +140,8 @@ function ChatPage() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const stopStreamRef = useRef<(() => void) | null>(null);
+  const streamInFlightRef = useRef(false);
+  const followLatestRef = useRef(true);
 
   // Source health, polled independently of the conversation. The analyst needs
   // to know a corpus is down *before* asking a question that depends on it,
@@ -150,15 +153,21 @@ function ChatPage() {
   });
 
   const scrollToBottom = useCallback(() => {
+    followLatestRef.current = true;
     setShowJumpToLatest(false);
-    setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    requestAnimationFrame(() => {
+      const el = scrollAreaRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
   }, []);
 
   const handleChatScroll = useCallback(() => {
     const el = scrollAreaRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    setShowJumpToLatest(distanceFromBottom > 180);
+    const isNearLatest = distanceFromBottom <= 120;
+    followLatestRef.current = isNearLatest;
+    setShowJumpToLatest(!isNearLatest);
   }, []);
 
   /**
@@ -170,31 +179,38 @@ function ChatPage() {
    * never reaches the bottom because it keeps restarting the trip there.
    *
    * Instant scroll on an animation frame instead: one paint-aligned jump per
-   * token batch, no competing animations. And it only follows when the analyst
-   * is already near the bottom, so scrolling up to re-read an earlier answer no
-   * longer yanks the view back down on the next token.
+   * token batch, no competing animations. The explicit follow flag is important
+   * because a large token batch can increase the bottom distance before this
+   * callback runs; measuring only after that growth incorrectly looks like the
+   * analyst scrolled away.
    */
   const followStream = useCallback(() => {
     const el = scrollAreaRef.current;
-    if (!el) return;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distanceFromBottom > 120) return;
+    if (!el || !followLatestRef.current) return;
     requestAnimationFrame(() => {
       el.scrollTop = el.scrollHeight;
     });
+  }, []);
+
+  // Browser storage is restored after hydration so the server and the first
+  // client render always produce identical markup.
+  useEffect(() => {
+    setMessages(loadStoredMessages());
+    setStorageLoaded(true);
   }, []);
 
   // Persist the transcript so navigating away and back does not lose it.
   // Streaming messages are stored too — the `streaming` flag is cleared on
   // load — so a mid-answer navigation keeps the text received so far.
   useEffect(() => {
+    if (!storageLoaded) return;
     try {
       sessionStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages));
     } catch {
       // Quota exceeded or storage disabled. The conversation still works in
       // memory; only persistence is lost, which is not worth interrupting for.
     }
-  }, [messages]);
+  }, [messages, storageLoaded]);
 
   /**
    * Start a fresh conversation.
@@ -378,6 +394,8 @@ function ChatPage() {
 
   const sendStream = useCallback(
     (chatMessages: ChatMessage[]) => {
+      if (streamInFlightRef.current) return;
+      streamInFlightRef.current = true;
       const aiMsgId = crypto.randomUUID();
       setMessages((prev) => [...prev, { id: aiMsgId, from: "ai", text: "", streaming: true }]);
       setIsStreaming(true);
@@ -395,16 +413,19 @@ function ChatPage() {
           followStream();
         },
         () => {
-          setMessages((prev) =>
-            prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m)),
-          );
+          setMessages((prev) => {
+            if (!accumulated.trim()) return prev.filter((m) => m.id !== aiMsgId);
+            return prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m));
+          });
           setIsStreaming(false);
+          streamInFlightRef.current = false;
           stopStreamRef.current = null;
         },
         (err) => {
           toast.error("Chat failed", { description: err.message });
           setMessages((prev) => prev.filter((m) => m.id !== aiMsgId));
           setIsStreaming(false);
+          streamInFlightRef.current = false;
           stopStreamRef.current = null;
         },
         undefined,
@@ -412,6 +433,15 @@ function ChatPage() {
         // screen while the answer is still being written.
         (provenance) => {
           setMessages((prev) => prev.map((m) => (m.id === aiMsgId ? { ...m, provenance } : m)));
+        },
+        () => {
+          setMessages((prev) => {
+            if (!accumulated.trim()) return prev.filter((m) => m.id !== aiMsgId);
+            return prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m));
+          });
+          setIsStreaming(false);
+          streamInFlightRef.current = false;
+          stopStreamRef.current = null;
         },
       );
 
@@ -428,7 +458,7 @@ function ChatPage() {
 
   const send = useCallback(async () => {
     if (!input.trim() && files.length === 0) return;
-    if (isStreaming) return;
+    if (isStreaming || streamInFlightRef.current) return;
 
     const userMsg: Msg = {
       id: crypto.randomUUID(),
@@ -454,7 +484,7 @@ function ChatPage() {
     } else if (capturedInput.trim()) {
       // Text only → streaming chat
       const history = messages
-        .filter((m) => !m.streaming)
+        .filter((m) => !m.streaming && m.text.trim())
         .map(
           (m) =>
             ({ role: m.from === "user" ? "user" : "assistant", content: m.text }) as ChatMessage,
@@ -599,7 +629,7 @@ function ChatPage() {
             <div
               ref={scrollAreaRef}
               onScroll={handleChatScroll}
-              className="min-h-0 flex-1 space-y-7 overflow-y-auto overscroll-contain px-5 py-6 md:px-8 lg:px-10"
+              className="min-h-0 flex-1 space-y-7 overflow-y-auto overscroll-contain px-5 py-6 [overflow-anchor:none] md:px-8 lg:px-10"
             >
               {messages.length === 0 && (
                 <div className="mx-auto flex h-full max-w-xl flex-col items-start justify-center text-left text-muted-foreground">
@@ -1029,6 +1059,32 @@ function EvidencePanel({
                   provenance={lastValidation.provenance}
                   degraded={lastValidation.degraded}
                 />
+              )}
+
+              {lastValidation.processing && lastValidation.processing.files.length > 0 && (
+                <div className="border-t border-border pt-4">
+                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Evidence processing
+                  </div>
+                  <ul className="space-y-2 text-xs leading-relaxed text-muted-foreground">
+                    {lastValidation.processing.files.map((file) => (
+                      <li key={file.filename} className="border-l-2 border-brand-cyan pl-2">
+                        <span className="font-semibold text-foreground">{file.filename}</span>
+                        <span>
+                          {` · ${file.size_bytes.toLocaleString()} bytes · ${file.selected_chars.toLocaleString()} of ${file.extracted_chars.toLocaleString()} extracted characters analyzed`}
+                        </span>
+                        {file.needs_manual_review && (
+                          <span className="block text-sev-medium">Manual review required.</span>
+                        )}
+                        {file.notices.map((notice) => (
+                          <span key={notice} className="block text-sev-medium">
+                            {notice}
+                          </span>
+                        ))}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
 
               {/* A validated finding is saved server-side, so the report

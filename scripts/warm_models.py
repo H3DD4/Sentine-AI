@@ -78,7 +78,11 @@ def _status(model_id: str) -> tuple[str, float, bool]:
         if not os.path.isdir(d):
             return "missing", 0.0, False
         mb = _dir_mb(d)
-        return ("cached", mb, True) if mb > 1 else ("partial", mb, False)
+        config_found = any(
+            "snapshots" in root and "config.json" in files
+            for root, _dirs, files in os.walk(d)
+        )
+        return ("cached", mb, True) if config_found else ("partial", mb, False)
 
     d = _repo_dir(model_id)
     if not os.path.isdir(d):
@@ -146,15 +150,15 @@ def warm(kind: str) -> bool:
 
             load_reranker_sync()
             if reranker_status():
-                print(f"  ✗ reranker did not load: {reranker_status()}")
+                print(f"  ERROR: reranker did not load: {reranker_status()}")
                 return False
         else:
             raise ValueError(f"unknown model kind: {kind}")
     except Exception as exc:
-        print(f"  ✗ {kind} failed: {type(exc).__name__}: {exc}")
+        print(f"  ERROR: {kind} failed: {type(exc).__name__}: {exc}")
         return False
 
-    print(f"  ✓ {kind} ready in {time.monotonic() - started:.0f}s")
+    print(f"  OK: {kind} ready in {time.monotonic() - started:.0f}s")
     return True
 
 

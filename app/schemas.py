@@ -1,5 +1,5 @@
-from pydantic import BaseModel, field_serializer
-from typing import Optional, List, Any
+from pydantic import BaseModel, field_serializer, field_validator
+from typing import Optional, List, Any, Literal
 from datetime import datetime
 from enum import Enum
 from app.config import LLMProvider
@@ -73,14 +73,34 @@ class ValidationResponse(ValidationResult):
     degraded: bool = False
     citations: List[RetrievedDoc] = []
     finding_id: Optional[str] = None
+    processing: Optional[dict] = None
 
 
 class FindingCreate(BaseModel):
     title: str
     description: str
+    verdict: Optional[VerdictEnum] = None
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+    matched_cves: List[str] = []
+    matched_techniques: List[str] = []
+    missing_evidence: List[str] = []
+    recommended_next_steps: List[str] = []
+    analyst_confirmed: bool = False
+    engagement_id: Optional[str] = None
 
 class FindingUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    verdict: Optional[VerdictEnum] = None
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+    matched_cves: Optional[List[str]] = None
+    matched_techniques: Optional[List[str]] = None
+    missing_evidence: Optional[List[str]] = None
+    recommended_next_steps: Optional[List[str]] = None
     analyst_confirmed: Optional[bool] = None
+    engagement_id: Optional[str] = None
 
 class EvidenceOut(BaseModel):
     id: str
@@ -109,6 +129,7 @@ class FindingOut(BaseModel):
     recommended_next_steps: List[str] = []
     analyst_confirmed: bool = False
     ghostwriter_finding_id: Optional[str] = None
+    engagement_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     evidence: List[EvidenceOut] = []
@@ -125,7 +146,7 @@ class FindingOut(BaseModel):
         from_attributes = True
 
 class ChatMessage(BaseModel):
-    role: str    # "user" | "assistant"
+    role: Literal["user", "assistant"]
     content: str
 
 class ChatRequest(BaseModel):
@@ -171,6 +192,27 @@ class ReportRequest(BaseModel):
     engagement_title: str
     client_name: str
     draft: Optional[ReportDraft] = None
+
+    @field_validator("engagement_title", "client_name")
+    @classmethod
+    def validate_report_metadata(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Report client and engagement metadata are required")
+        return value
+
+
+class GeneratedReportOut(BaseModel):
+    id: str
+    client_name: str
+    engagement_title: str
+    filename: str
+    finding_snapshot: List[dict] = []
+    draft_snapshot: Optional[dict] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class ReadinessDimension(BaseModel):

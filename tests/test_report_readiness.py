@@ -7,7 +7,13 @@ from docx import Document
 
 from app.schemas import ChatMessage, ReportDraft
 from app.services.report import generate_report_docx
-from app.routers.chat import _needs_retrieval, _social_reply
+from app.kb.base import SearchOutcome
+from app.routers.chat import (
+    _bounded_provider_messages,
+    _conversation_outcome,
+    _needs_retrieval,
+    _social_reply,
+)
 from app.services.report_readiness import (
     READINESS_THRESHOLD,
     _normalize_extraction,
@@ -18,6 +24,40 @@ from app.services.report_readiness import (
 
 
 class ReportReadinessTests(unittest.TestCase):
+    def test_long_assessment_is_preserved_in_provider_context(self):
+        assessment = "Observed command execution evidence. " * 80
+        messages = [ChatMessage(role="user", content=assessment)]
+
+        bounded = _bounded_provider_messages(messages)
+
+        self.assertGreater(len(assessment), 1500)
+        self.assertEqual(bounded, [{"role": "user", "content": assessment}])
+
+    def test_provider_context_is_bounded_and_keeps_latest_user_turn(self):
+        latest = "Latest evidence must remain intact."
+        messages = [
+            ChatMessage(role="user", content=f"old user {index} " + "x" * 5000)
+            if index % 2 == 0
+            else ChatMessage(role="assistant", content=f"old assistant {index} " + "y" * 5000)
+            for index in range(20)
+        ]
+        messages.append(ChatMessage(role="user", content=latest))
+
+        bounded = _bounded_provider_messages(messages, max_messages=8, max_chars=12_000)
+
+        self.assertEqual(bounded[-1], {"role": "user", "content": latest})
+        self.assertLessEqual(len(bounded), 8)
+        self.assertLessEqual(sum(len(message["content"]) for message in bounded), 12_000)
+        self.assertEqual(bounded[0]["role"], "user")
+
+    def test_retrieval_failure_degrades_instead_of_raising(self):
+        with patch("app.routers.chat.federated_search", new=AsyncMock(side_effect=RuntimeError("model unavailable"))):
+            outcome = asyncio.run(_conversation_outcome("Analyze this finding", [], AsyncMock()))
+
+        self.assertIsInstance(outcome, SearchOutcome)
+        self.assertTrue(outcome.degraded)
+        self.assertIn("not grounded", outcome.notes[0])
+
     def test_greeting_does_not_trigger_knowledge_retrieval(self):
         self.assertFalse(_needs_retrieval("hello"))
         self.assertFalse(_needs_retrieval("Good morning!"))

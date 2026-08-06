@@ -1,13 +1,7 @@
 """
 MITRE ATT&CK sync → `mitre_techniques` table + `kb_mitre` Qdrant collection.
 
-Note: this sync has never successfully populated the knowledge base — the
-existing Qdrant collection contains 10,459 CVE points and zero technique
-points.  Every MITRE mapping the product has produced so far therefore came
-from the LLM's parametric memory rather than from retrieved ATT&CK data, which
-is exactly the failure mode this KB exists to prevent.
-
-Unlike the old version, deprecated and revoked techniques are stored rather
+Deprecated and revoked techniques are stored rather
 than dropped, with a `deprecated` flag.  They are filtered out of retrieval by
 default, but keeping them means an analyst pasting an older technique ID still
 gets an answer ("T1064 is deprecated, superseded by T1059") instead of silence.
@@ -16,13 +10,15 @@ gets an answer ("T1064 is deprecated, superseded by T1059") instead of silence.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 import httpx
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.kb.indexer import index_rows
+from app.kb.indexer import delete_document, index_rows
 from app.kb.models import MitreTechnique
 from app.kb.registry import get_source
 from app.services.retrieval import get_qdrant
@@ -39,7 +35,7 @@ async def sync_mitre(session: AsyncSession) -> dict:
         resp.raise_for_status()
         bundle = resp.json()
 
-    attack_version = _bundle_version(bundle)
+    attack_version = _bundle_version(bundle) or _release_version(str(resp.url))
     rows: list[MitreTechnique] = []
 
     for obj in bundle.get("objects", []):
@@ -91,8 +87,36 @@ async def sync_mitre(session: AsyncSession) -> dict:
     log.info("MITRE: %d techniques persisted, indexing…", len(rows))
 
     stats = await index_rows(source, session, qdrant, rows)
+    if stats.failed:
+        raise RuntimeError(
+            f"MITRE indexing failed for {stats.failed} techniques; stale data retained"
+        )
+
+    canonical_ids = [row.technique_id for row in rows]
+    stale_ids = list(
+        (
+            await session.execute(
+                select(MitreTechnique.technique_id).where(
+                    MitreTechnique.technique_id.not_in(canonical_ids)
+                )
+            )
+        ).scalars()
+    )
+    for technique_id in stale_ids:
+        await delete_document(qdrant, source, technique_id)
+    if stale_ids:
+        await session.execute(
+            delete(MitreTechnique).where(MitreTechnique.technique_id.in_(stale_ids))
+        )
+        await session.commit()
+
     log.info("MITRE sync complete: %s", stats)
-    return {"rows": len(rows), **stats.to_dict()}
+    return {
+        "attack_version": attack_version,
+        "rows": len(rows),
+        "removed_stale_rows": len(stale_ids),
+        **stats.to_dict(),
+    }
 
 
 def _external_id(obj: dict) -> Optional[str]:
@@ -107,3 +131,8 @@ def _bundle_version(bundle: dict) -> Optional[str]:
         if obj.get("type") == "x-mitre-collection":
             return obj.get("x_mitre_version")
     return None
+
+
+def _release_version(url: str) -> Optional[str]:
+    match = re.search(r"/download/v([^/]+)/", url)
+    return match.group(1) if match else None

@@ -49,6 +49,7 @@ export interface Finding {
   recommended_next_steps: string[];
   analyst_confirmed: boolean;
   ghostwriter_finding_id: string | null;
+  engagement_id: string | null;
   created_at: string | null;
   updated_at: string | null;
   evidence: Evidence[];
@@ -190,8 +191,25 @@ export interface Provenance {
   citations: Citation[];
 }
 
+export interface ProcessingFile {
+  filename: string;
+  file_type: string;
+  size_bytes: number;
+  extracted_chars: number;
+  selected_chars: number;
+  needs_manual_review: boolean;
+  notices: string[];
+}
+
+export interface ProcessingManifest {
+  files: ProcessingFile[];
+  total_bytes: number;
+  notices: string[];
+}
+
 export interface ChatResponse extends Partial<Provenance> {
   response: string;
+  processing?: ProcessingManifest;
 }
 
 export interface ValidationResult {
@@ -207,6 +225,7 @@ export interface ValidationResult {
 export type ValidationResponse = ValidationResult &
   Partial<Provenance> & {
     finding_id?: string | null;
+    processing?: ProcessingManifest | null;
   };
 
 export interface ReportDraft {
@@ -269,6 +288,16 @@ export interface ReportRequest {
   draft?: ReportDraft;
 }
 
+export interface GeneratedReport {
+  id: string;
+  client_name: string;
+  engagement_title: string;
+  filename: string;
+  finding_snapshot: Array<{ id: string; title: string; verdict: Verdict | null }>;
+  draft_snapshot: ReportDraft | null;
+  created_at: string;
+}
+
 export interface AppSettings {
   llm_provider: string;
   anthropic_api_key_set: boolean;
@@ -322,6 +351,18 @@ export class ApiError extends Error {
   }
 }
 
+async function responseError(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  if (!text) return `HTTP ${res.status}`;
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown };
+    if (typeof payload.detail === "string") return payload.detail;
+  } catch {
+    // The backend may intentionally return plain text.
+  }
+  return text;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -343,8 +384,7 @@ async function request<T>(
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "Unknown error");
-    throw new ApiError(text || `HTTP ${res.status}`, res.status);
+    throw new ApiError(await responseError(res), res.status);
   }
 
   // Binary response (DOCX download)
@@ -386,8 +426,29 @@ export function streamChatMessage(
   onError: (err: Error) => void,
   findingId?: string,
   onSources?: (provenance: Provenance) => void,
+  onAbort?: () => void,
 ): () => void {
   const controller = new AbortController();
+  let manuallyAborted = false;
+  let timedOut = false;
+  let settled = false;
+  let timeout = 0;
+
+  const armTimeout = (delay: number) => {
+    window.clearTimeout(timeout);
+    timeout = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, delay);
+  };
+  armTimeout(90_000);
+
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    window.clearTimeout(timeout);
+    callback();
+  };
 
   (async () => {
     try {
@@ -399,8 +460,7 @@ export function streamChatMessage(
       });
 
       if (!res.ok) {
-        const text = await res.text().catch(() => `HTTP ${res.status}`);
-        throw new ApiError(text, res.status);
+        throw new ApiError(await responseError(res), res.status);
       }
 
       const reader = res.body!.getReader();
@@ -410,6 +470,8 @@ export function streamChatMessage(
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        // Once the server is responding, only abort a genuinely stalled stream.
+        armTimeout(60_000);
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n\n");
@@ -429,7 +491,7 @@ export function streamChatMessage(
           // error is not swallowed by the JSON-parse handler.
           if (payload.error) throw new Error(String(payload.error));
           if (payload.done) {
-            onDone();
+            finish(onDone);
             return;
           }
           if (payload.sources && onSources) {
@@ -438,15 +500,25 @@ export function streamChatMessage(
           if (payload.token) onToken(String(payload.token));
         }
       }
-      onDone();
+      finish(onDone);
     } catch (err) {
-      if ((err as Error).name !== "AbortError") {
-        onError(err instanceof Error ? err : new Error(String(err)));
+      if ((err as Error).name === "AbortError") {
+        finish(() => {
+          if (manuallyAborted) onAbort?.();
+          else if (timedOut)
+            onError(new Error("The chat stream stopped responding. Please try again."));
+          else onError(new Error("The chat request was interrupted. Please try again."));
+        });
+      } else {
+        finish(() => onError(err instanceof Error ? err : new Error(String(err))));
       }
     }
   })();
 
-  return () => controller.abort();
+  return () => {
+    manuallyAborted = true;
+    controller.abort();
+  };
 }
 
 // ─── Validation ───────────────────────────────────────────────────────
@@ -483,7 +555,22 @@ export async function createFinding(title: string, description: string): Promise
 
 export async function updateFinding(
   id: string,
-  data: { analyst_confirmed?: boolean },
+  data: Partial<
+    Pick<
+      Finding,
+      | "title"
+      | "description"
+      | "verdict"
+      | "confidence"
+      | "reasoning"
+      | "matched_cves"
+      | "matched_techniques"
+      | "missing_evidence"
+      | "recommended_next_steps"
+      | "analyst_confirmed"
+      | "engagement_id"
+    >
+  >,
 ): Promise<Finding> {
   return request<Finding>("PATCH", `/findings/${id}`, data);
 }
@@ -603,6 +690,18 @@ export async function assessReportReadiness(messages: ChatMessage[]): Promise<Re
 
 export async function generateReport(requestData: ReportRequest): Promise<Blob> {
   return request<Blob>("POST", "/reports/generate", requestData);
+}
+
+export async function listReports(): Promise<GeneratedReport[]> {
+  return request<GeneratedReport[]>("GET", "/reports");
+}
+
+export async function downloadReport(id: string): Promise<Blob> {
+  return request<Blob>("GET", `/reports/${id}/download`);
+}
+
+export async function deleteReport(id: string): Promise<void> {
+  return request<void>("DELETE", `/reports/${id}`);
 }
 
 // ─── Settings ─────────────────────────────────────────────────────────

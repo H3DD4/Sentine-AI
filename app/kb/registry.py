@@ -34,6 +34,8 @@ from app.kb.sources import (
     InternalSource,
     MitreSource,
     NVDSource,
+    OwaspDocsSource,
+    OwaspSource,
 )
 
 log = logging.getLogger(__name__)
@@ -46,6 +48,8 @@ log = logging.getLogger(__name__)
 _SOURCES: list[KBSource] = [
     NVDSource(),
     MitreSource(),
+    OwaspSource(),
+    OwaspDocsSource(),
     GhostwriterSource(),
     InternalSource(),
 ]
