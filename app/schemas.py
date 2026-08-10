@@ -15,17 +15,62 @@ class Token(BaseModel):
     token_type: str
 
 class UserCreate(BaseModel):
+    username: str
     email: str
     password: str
 
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not 3 <= len(value) <= 64:
+            raise ValueError("Username must be between 3 and 64 characters")
+        if not all(character.isalnum() or character in "._-" for character in value):
+            raise ValueError("Username may contain only letters, numbers, dots, hyphens, and underscores")
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        value = value.strip().lower()
+        local, separator, domain = value.partition("@")
+        if not separator or not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("Enter a valid email address")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if not 8 <= len(value) <= 128:
+            raise ValueError("Password must be between 8 and 128 characters")
+        return value
+
 class UserOut(BaseModel):
     id: str
+    username: Optional[str] = None
     email: str
     is_active: bool
-    created_at: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    @field_serializer("created_at", mode="plain", when_used="json")
+    def _serialize_dt(self, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return str(v)
 
     class Config:
         from_attributes = True
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class TokenWithRefresh(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
 
 class ValidationResult(BaseModel):
     verdict: VerdictEnum

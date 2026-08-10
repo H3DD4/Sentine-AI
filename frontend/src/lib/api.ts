@@ -9,7 +9,11 @@
  * - Added streamChat() for SSE streaming
  * - Added request abort controller support
  * - getApiKey() removed (endpoint was a security risk — removed from backend)
+ * - All requests now go through apiFetch() which injects JWT Authorization
+ *   headers and automatically refreshes on 401.
  */
+
+import { apiFetch } from "./auth";
 
 // Vite runs separately in development; deployed builds use the current origin.
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "");
@@ -400,7 +404,7 @@ async function request<T>(
     headers["Content-Type"] = "application/json";
   }
 
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method,
     headers,
     body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
@@ -476,7 +480,7 @@ export function streamChatMessage(
 
   (async () => {
     try {
-      const res = await fetch(`${API_BASE}/chat/stream`, {
+      const res = await apiFetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages, finding_id: findingId }),

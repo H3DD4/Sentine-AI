@@ -32,38 +32,224 @@ The authoritative implementation is in `app/`, `frontend/src/`, `docker-compose.
 ## System Boundary
 
 ```text
-                         Analyst browser
-                              |
-                HTTP JSON / multipart / POST SSE
-                              |
-                 +------------v-------------+
-                 | React / TanStack Start   |
-                 | frontend/                |
-                 +------------+-------------+
-                              |
-                VITE_API_BASE_URL or same origin
-                              |
-                 +------------v-------------+
-                 | FastAPI application      |
-                 | app/main.py               |
-                 | Uvicorn / ASGI            |
-                 +--+------+------+---------+
-                    |      |      |
-          +---------+      |      +------------------+
-          |                |                         |
-  +-------v------+  +------v-------+          +------v-------+
-  | PostgreSQL   |  | Qdrant       |          | Filesystem   |
-  | source rows, |  | dense/sparse |          | evidence,    |
-  | findings,    |  | collections  |          | templates,   |
-  | audit,       |  | derived from |          | generated    |
-  | reports      |  | PostgreSQL   |          | DOCX reports |
-  +--------------+  +--------------+          +--------------+
-                    |
-             +------v-------------------------------+
-             | External services                    |
-             | LLM provider, NVD, MITRE, OWASP,     |
-             | Ghostwriter GraphQL                   |
-             +--------------------------------------+
+LEGEND
+  ---> synchronous request/data flow       -SSE-> streamed response frames
+  ==>  persistence/indexing flow            -X->   failure isolated or rejected
+
++===============================================================================================================+
+| 1. ANALYST EXPERIENCE - React 19 / TanStack Start / React Query / frontend/src                                |
+|                                                                                                               |
+|  / Dashboard              /chat Analysis              /knowledge                 /report + /settings          |
+|  findings/engagements     transcript + evidence       health/browse/search       findings/templates/sections |
+|          |                         |                           |                           |                    |
+|          |                 sessionStorage                     |                  report handoff in             |
+|          |                 sentinel.chat.v1                    |                  sentinel.report.handoff.v1   |
++==========+=========================+===========================+===========================+====================+
+           |                         |                           |                           |
+           +-------------------------+---------------------------+---------------------------+
+                                             |
+                          JSON / multipart FormData / POST-based SSE
+                          VITE_API_BASE_URL, dev localhost:8000, or same origin
+                                             |
++============================================v==================================================================+
+| 2. HTTP APPLICATION BOUNDARY - Uvicorn ASGI -> FastAPI app/main.py                                             |
+|                                                                                                               |
+| Routers                                                                                                       |
+| /auth  /chat  /validate  /findings  /engagements  /kb  /reports  /ghostwriter  /settings  /audit             |
+|                                             |                                                                 |
+|      +--------------------------------------+----------------------------------------------+                  |
+|      |                                      |                                              |                  |
+|      v                                      v                                              v                  |
+|  SCENARIO A                             SCENARIO B                                     SCENARIO C             |
+|  Text-only chat                        Finding + uploaded evidence                    Direct KB operation     |
+|  POST /chat or /chat/stream            POST /validate or /chat/with-evidence          GET /kb/search          |
+|      |                                      |                                              |                  |
+|      | /chat returns JSON                  | stage_evidence_uploads()                       | query + filters  |
+|      | /chat/stream returns SSE            | /validate: validate + persist                  | source selection |
+|      | action=validate: persist finding    | with-evidence action=validate: persist         | top_k / cvss_min |
+|      | latest turn + prior 3 user turns    | with-evidence no action: analyze + cleanup     |                  |
+|      | provider history <=24 messages      | 1 MiB writes; safe basename                    |                  |
+|      | and <=48,000 characters             | <=20 files, <=50 MiB/file, <=100 MiB/request   |                  |
+|      |                                      v                                              |                  |
+|      |                              +-------+---------------------------+                  |                  |
+|      |                              | Evidence parser                    |                  |                  |
+|      |                              | text/log -> UTF-8 extraction       |                  |                  |
+|      |                              | PDF -> PyMuPDF page text           |                  |                  |
+|      |                              | image -> configured vision LLM     |                  |                  |
+|      |                              | binary -> retain + manual review   |                  |                  |
+|      |                              | head/tail representative excerpts |                  |                  |
+|      |                              | explicit processing manifest      |                  |                  |
+|      |                              +----------------+------------------+                  |                  |
+|      |                                               |                                     |                  |
+|      +-----------------------------------------------+-------------------------------------+                  |
+|                                                      |                                                        |
+|                                           SHARED RAG ENTRY                                                     |
+|                                   federated_search / multimodal_search                                        |
++======================================================+========================================================+
+                                                       |
++======================================================v========================================================+
+| 3. MULTIMODAL QUERY PLANNER - app/services/query_planner.py                                                    |
+|                                                                                                               |
+| Inputs: analyst description + prior context + extracted text/logs + vision descriptions                       |
+|                                                                                                               |
+|   Description arm             Identifier arm             Evidence arms              Image arms               |
+|   <=1,500 chars               regex-extracted IDs        <=600 chars each           <=600 chars each         |
+|   weight 1.00                 CVE / T####.### / OWASP    weight 0.70                weight 0.55               |
+|                               weight 1.20                                                                    |
+|          |                           |                         |                          |                    |
+|          +---------------------------+-------------------------+--------------------------+                    |
+|                                                      |                                                        |
+|   Remove separator/noise lines -> deduplicate near-identical arms -> evenly sample all files -> max 5 queries |
++======================================================+========================================================+
+                                                       |
+                         one federated_search() execution per planned query, concurrently
+                                                       |
++======================================================v========================================================+
+| 4. FEDERATED MULTI-RAG ORCHESTRATOR - app/services/retrieval.py                                                |
+|                                                                                                               |
+| 4.1 Preflight                                                                                                 |
+|   query text -> BAAI/bge-base-en-v1.5 dense query embedding (768 dimensions)                                  |
+|              -> Qdrant/bm25 sparse query embedding                                                            |
+|              -> 30-second source-health cache                                                                  |
+|              -> resolve selected sources; omitted filter means ALL six sources                                |
+|                                                                                                               |
+| 4.2 Parallel source fan-out                                                                                    |
+|                                                                                                               |
+|   +----------------+ +----------------+ +----------------+ +----------------+ +----------------+ +------------+ |
+|   | NVD            | | MITRE ATT&CK   | | OWASP Top 10  | | OWASP Docs     | | Ghostwriter    | | Internal   | |
+|   | nvd_entries    | | mitre_techniques| | owasp_top10   | | owasp_documents| | historical     | | playbooks  | |
+|   | kb_nvd         | | kb_mitre       | | kb_owasp      | | kb_owasp_docs  | | kb_ghostwriter | | kb_internal| |
+|   | weight 1.00    | | weight 1.00    | | weight 1.10   | | weight 1.15    | | weight 1.25    | | weight 1.10| |
+|   +-------+--------+ +-------+--------+ +-------+--------+ +-------+--------+ +-------+--------+ +------+-----+ |
+|           |                  |                  |                  |                  |                 |       |
+|           +------------------+------------------+------------------+------------------+-----------------+       |
+|                                                      |                                                        |
+| 4.3 Inside EACH healthy source collection                                                                         |
+|                                                                                                               |
+|   Dense prefetch top 40 using named vector `dense`                                                               |
+|               +                                                                                               |
+|   Sparse BM25 prefetch top 40 using named vector `sparse`                                                       |
+|               |                                                                                               |
+|               +--> Qdrant server-side Reciprocal Rank Fusion (RRF)                                             |
+|               |                                                                                               |
+|   Exact-ID payload lookup: doc_id MatchAny; same CVSS/payload/deprecation filters                              |
+|               |                                                                                               |
+|               +--> exact matches pinned first                                                                  |
+|               +--> collapse chunks by doc_id, retain best matching chunk                                       |
+|               +--> maximum 15 documents from this source                                                       |
+|                                                                                                               |
+|   Filters: MITRE deprecated=false; cvss_min on NVD/Ghostwriter; optional source payload filters               |
+|                                                                                                               |
+| 4.4 Cross-source and cross-query ranking                                                                         |
+|                                                                                                               |
+|   Per-source ranked lists                                                                                        |
+|        -> weighted cross-source RRF, K=60                                                                        |
+|        -> up to 40 candidates                                                                                    |
+|        -> BAAI/bge-reranker-base cross-encoder(query, title + chunk)                                            |
+|        -> relevance floor -2.0; preserve best result if every candidate is below floor                         |
+|        -> default final top 8                                                                                    |
+|        -> multimodal weighted RRF across description/ID/evidence/image query outcomes                         |
+|                                                                                                               |
+| 4.5 Output contract                                                                                             |
+|   SearchOutcome = final RetrievalHit[] + SourceReport[] + notes + degraded flag + provenance line             |
+|   Every hit keeps source_key, source_label, doc_id, title, chunk text, score, URL, and payload                 |
++======================================================+========================================================+
+                                                       |
+                     +---------------------------------+----------------------------------+
+                     |                                                                    |
+                     v                                                                    v
++===============================================+                     +=========================================+
+| 5A. CONVERSATIONAL ANSWER                     |                     | 5B. STRUCTURED VALIDATION               |
+|                                               |                     |                                         |
+| Inject [DATA COVERAGE] and source-labelled    |                     | Context budgets:                        |
+| [KB CONTEXT] before latest user message       |                     | finding 24k chars, evidence 24k,        |
+|                                               |                     | images 8k, KB context 16k               |
+| AsyncLLMClient chat model                     |                     |                                         |
+| Anthropic / OpenAI / Together / OpenRouter /  |                     | VALIDATION_SYSTEM + exact JSON schema   |
+| Ollama / Gemini                               |                     | -> AsyncLLMClient validation model      |
+|                                               |                     | -> parse/normalize ValidationResult     |
+| First SSE frame: source provenance            |                     | -> degraded retrieval caps confidence  |
+| Token frames: generated text                  |                     |    at 0.70                              |
+| Final frame: done=true                        |                     |                                         |
+|                                               |                     | verdict / confidence / reasoning /      |
+| Retrieval timeout/failure                     |                     | CVEs / ATT&CK / gaps / evidence steps   |
+| -X-> continue explicitly ungrounded/degraded  |                     | LLM/retrieval failure -X-> no invented  |
++===============================================+                     | verdict                                 |
+                                                                      +--------------------+--------------------+
+                                                                                           |
+                                                                                           v
++===============================================================================================================+
+| 6. AUTHORITATIVE PERSISTENCE                                                                                   |
+|                                                                                                               |
+| PostgreSQL (source of truth)                  Filesystem                       Qdrant (derived/searchable)      |
+| -------------------------------------------  -------------------------------  ------------------------------- |
+| findings + structured report fields          complete evidence artifacts     six source collections          |
+| evidence metadata/extracted representations  uploaded DOCX templates         480-token chunks / 64 overlap   |
+| engagements and users                         generated DOCX reports           deterministic chunk point IDs   |
+| audit_logs with provenance/manifests          staged files cleaned on failure dense + sparse vectors           |
+| generated_reports + report snapshots                                                                           |
+| report_templates                                                                                               |
+| nvd/mitre/owasp/ghostwriter/internal rows                                                                       |
+| kb_source_state                                                                                                |
++==============================+===============================================+================================+
+                               |                                               |
+              +----------------+------------------+                            |
+              |                                   |                            |
+              v                                   v                            |
++================================+  +===========================================+=================================+
+| 7A. REPORT READINESS           |  | 7B. CLIENT REPORT GENERATION                                                |
+| POST /reports/readiness        |  | POST /reports/generate                                                      |
+|                                |  |                                                                              |
+| conversation -> bounded LLM    |  | Load selected Finding rows + optional conversation ReportDraft              |
+| extraction into ReportDraft    |  | -> reject missing IDs                                                       |
+| -> deterministic dimensions:  |  | -> server-side completeness gate:                                           |
+| identity, scope, evidence,     |  |    title + description + affected scope + technical evidence + impact       |
+| reproduction, impact/rating,   |  |    + severity + analyst verdict                                             |
+| references/mapping             |  | -> incomplete -X-> HTTP 422, no placeholder-filled client report            |
+| -> advisory threshold 3.5/10   |  | -> load selected template or active template                               |
+| -> provider failure:           |  | -> replace DOCX placeholders in body/tables/headers/footers:               |
+|    conservative text fallback  |  |    CLIENT_NAME / ENGAGEMENT_TITLE / GENERATED_AT / TOTAL_FINDINGS           |
++================+===============+  | -> include only analyst-selected sections                                   |
+                 |                  | -> deterministic python-docx export; NO report-writing LLM                   |
+                 |                  | -> write REPORT_DIR file + GeneratedReport + AuditLog + SHA-256             |
+                 |                  +===========================================+=================================+
+                 |                                                              |
+                 +--> sessionStorage handoff -> /report editor ------------------+
+
++===============================================================================================================+
+| 8. OFFLINE / SCHEDULED KNOWLEDGE INGESTION                                                                     |
+|                                                                                                               |
+| External authoritative feeds                                                                                  |
+|                                                                                                               |
+| NVD API -- every 6h --> parse CVE/CVSS/CWE/CPE --> upsert nvd_entries --------------------------------+      |
+| MITRE STIX -- every 7d --> parse techniques/sub-techniques/version/deprecation --> mitre_techniques ----+      |
+| OWASP official repositories -- manual sync_security_kb --> owasp_top10 + owasp_documents ---------------+      |
+| Analyst POST /kb/entries --> internal_docs --------------------------------------------------------------+      |
+| Ghostwriter GraphQL --> projects/push; synchronized ghostwriter_findings require a separate ingest path +      |
+|                                                                                                         |      |
+| For every changed PostgreSQL source row:                                                                |      |
+|   adapter.build_text(row) -> content SHA-256 -> tokenizer-aware 480/64 chunks                            |      |
+|   -> dense document embeddings + sparse BM25 embeddings -> Qdrant upsert                                |      |
+|   -> delete stale chunks -> stamp qdrant_synced_at only after success                                   |      |
+|                                                                                                         |      |
+| PostgreSQL/Qdrant mismatch -> source health DEGRADED -> still search partial data + disclose provenance <+      |
++===============================================================================================================+
+
++===============================================================================================================+
+| 9. HEALTH, FAILURE ISOLATION, AND OPERATOR VISIBILITY                                                           |
+|                                                                                                               |
+| Source state machine per corpus: OK | NO_MATCH | EMPTY | DEGRADED | UNAVAILABLE | DISABLED                    |
+| Health inputs: PostgreSQL rows + unsynced rows + Qdrant collection existence/points + operator enabled flag    |
+|                                                                                                               |
+| sparse model unavailable  -> dense-only retrieval + visible note                                              |
+| reranker unavailable      -> retain weighted-RRF order + visible note                                         |
+| one source unavailable    -> skip only that source; healthy sources continue; provenance names failed source  |
+| all sources unavailable   -> chat may answer from general model knowledge only when explicitly marked         |
+| retrieval timeout         -> chat continues ungrounded/degraded; validation does not invent a verdict         |
+| LLM quota/provider error  -> retries; readiness conservative fallback; stream emits error then done            |
+| evidence parse failure    -> manual-review notice or request failure; staged artifacts cleaned                 |
+| report/template missing   -> HTTP 404/410; incomplete content -> HTTP 422                                      |
++===============================================================================================================+
 ```
 
 ## Components

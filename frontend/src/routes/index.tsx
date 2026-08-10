@@ -288,9 +288,9 @@ function Dashboard() {
                       <td className="px-3 py-3 text-right text-xs tabular-nums">
                         <span
                           className={
-                            (f.confidence || 0) >= 85
+                            (f.confidence || 0) >= 0.85
                               ? "text-verdict-confirmed"
-                              : (f.confidence || 0) >= 60
+                              : (f.confidence || 0) >= 0.6
                                 ? "text-verdict-review"
                                 : "text-muted-foreground"
                           }

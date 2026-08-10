@@ -10,7 +10,7 @@ Key changes:
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -28,6 +28,7 @@ from app.ingestion.embedder import load_model_sync, load_sparse_model_sync
 from app.kb.indexer import ensure_all_collections
 from app.kb.registry import all_sources, check_all_sources
 from app.services.retrieval import init_qdrant_client, get_qdrant
+from app.auth import get_current_active_user
 import logging
 import os
 
@@ -153,15 +154,16 @@ app.add_middleware(
 # ── Routers ───────────────────────────────────────────────────────────────────
 
 app.include_router(auth.router)
-app.include_router(chat.router)
-app.include_router(validate.router)
-app.include_router(findings.router)
-app.include_router(report.router)
-app.include_router(ghostwriter.router)
-app.include_router(kb.router)
-app.include_router(engagements.router)
-app.include_router(settings_router.router)
-app.include_router(audit.router)
+protected = [Depends(get_current_active_user)]
+app.include_router(chat.router, dependencies=protected)
+app.include_router(validate.router, dependencies=protected)
+app.include_router(findings.router, dependencies=protected)
+app.include_router(report.router, dependencies=protected)
+app.include_router(ghostwriter.router, dependencies=protected)
+app.include_router(kb.router, dependencies=protected)
+app.include_router(engagements.router, dependencies=protected)
+app.include_router(settings_router.router, dependencies=protected)
+app.include_router(audit.router, dependencies=protected)
 
 # ── Static files + SPA fallback ───────────────────────────────────────────────
 

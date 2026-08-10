@@ -6,12 +6,15 @@ import {
   useRouter,
   HeadContent,
   Scripts,
+  useNavigate,
+  useRouterState,
 } from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import appCss from "../styles.css?url";
 import { reportLovableError } from "../lib/lovable-error-reporting";
 import { Toaster } from "@/components/ui/sonner";
+import { authRefresh, getRefreshToken, isAuthenticated } from "@/lib/auth";
 
 function NotFoundComponent() {
   return (
@@ -102,7 +105,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
         rel: "stylesheet",
         href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Sans+3:wght@300;400;500;600;700&display=swap",
       },
-      { rel: "icon", href: "/favicon.ico", type: "image/x-icon" },
+      { rel: "icon", href: "/favicon.png", type: "image/png" },
     ],
   }),
   shellComponent: RootShell,
@@ -127,11 +130,44 @@ function RootShell({ children }: { children: ReactNode }) {
 
 function RootComponent() {
   const { queryClient } = Route.useRouteContext();
+  const navigate = useNavigate();
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const restoreSession = async () => {
+      const onLogin = pathname === "/login";
+      let authenticated = isAuthenticated();
+      if (!authenticated && getRefreshToken()) {
+        authenticated = Boolean(await authRefresh());
+      }
+      if (!active) return;
+      if (authenticated && onLogin) {
+        navigate({ to: "/", replace: true });
+        return;
+      }
+      if (!authenticated && !onLogin) {
+        navigate({ to: "/login", replace: true });
+        return;
+      }
+      setAuthReady(true);
+    };
+    restoreSession();
+    return () => {
+      active = false;
+    };
+  }, [navigate, pathname]);
 
   return (
     <QueryClientProvider client={queryClient}>
-      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
-      <Outlet />
+      {authReady ? (
+        <Outlet />
+      ) : (
+        <div className="flex min-h-screen items-center justify-center bg-background">
+          <div className="h-6 w-6 animate-spin rounded-full border-2 border-brand-cyan/25 border-t-brand-cyan" />
+        </div>
+      )}
       <Toaster position="bottom-right" />
     </QueryClientProvider>
   );
