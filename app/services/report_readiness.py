@@ -7,7 +7,7 @@ import asyncio
 import logging
 from typing import Any
 
-from app.models import Finding, VerdictEnum as FindingVerdict
+from app.models import Evidence, Finding, VerdictEnum as FindingVerdict
 from app.schemas import (
     ChatMessage,
     ReadinessDimension,
@@ -178,12 +178,68 @@ def _fallback_draft(user_text: str) -> ReportDraft:
     )
 
 
-async def assess_conversation(messages: list[ChatMessage]) -> ReportReadinessResponse:
+def finding_report_draft(finding: Finding, evidence: list[Evidence]) -> ReportDraft:
+    """Build a durable baseline from structured finding and evidence records."""
+    evidence_text = "\n\n".join(
+        f"{item.filename}:\n{content}"
+        for item in evidence
+        if (content := item.image_description or item.extracted_text)
+    )[:32_000]
+    verdict = getattr(finding.verdict, "value", finding.verdict)
+    return ReportDraft(
+        title=finding.title or "",
+        affected_scope=finding.affected_scope or "",
+        description=finding.description or "",
+        technical_evidence=finding.technical_evidence or evidence_text,
+        reproduction_steps=finding.reproduction_steps or [],
+        impact=finding.impact or "",
+        severity=finding.severity or "",
+        cvss_score=finding.cvss_score,
+        cvss_vector=finding.cvss_vector or "",
+        remediation=finding.recommended_next_steps or [],
+        matched_cves=finding.matched_cves or [],
+        matched_techniques=finding.matched_techniques or [],
+        verdict=verdict,
+        confidence=finding.confidence,
+    )
+
+
+def _merge_known_facts(extracted: ReportDraft, baseline: ReportDraft | None) -> ReportDraft:
+    if baseline is None:
+        return extracted
+    data = extracted.model_dump()
+    for field, known in baseline.model_dump().items():
+        if not _present(data.get(field)) and _present(known):
+            data[field] = known
+    return ReportDraft(**data)
+
+
+def finding_evidence_context(finding: Finding, evidence: list[Evidence]) -> str:
+    """Render persisted validation facts as admissible report source material."""
+    sections = [
+        f"Finding title: {finding.title or ''}",
+        f"Finding description: {finding.description or ''}",
+        f"Validation verdict: {getattr(finding.verdict, 'value', finding.verdict) or ''}",
+        f"Validation confidence: {finding.confidence if finding.confidence is not None else ''}",
+        f"Validation reasoning: {finding.reasoning or ''}",
+    ]
+    for item in evidence:
+        content = item.image_description or item.extracted_text
+        if content:
+            sections.append(f"Persisted evidence ({item.filename}):\n{content[:12_000]}")
+    return "\n\n".join(section for section in sections if section.strip())[-40_000:]
+
+
+async def assess_conversation(
+    messages: list[ChatMessage],
+    persisted_context: str = "",
+    baseline: ReportDraft | None = None,
+) -> ReportReadinessResponse:
     user_text = "\n".join(message.content for message in messages if message.role == "user").strip()
-    if not user_text:
+    if not user_text and not persisted_context:
         return score_report_draft(ReportDraft())
     normalized = " ".join(user_text.lower().split()).strip(".!?,")
-    if normalized in _SOCIAL_TURNS:
+    if normalized in _SOCIAL_TURNS and not persisted_context:
         return score_report_draft(ReportDraft())
 
     # Ordinary assistant prose can contain suggestions or general knowledge;
@@ -197,6 +253,10 @@ async def assess_conversation(messages: list[ChatMessage]) -> ReportReadinessRes
     transcript = "\n\n".join(
         f"{message.role.upper()}: {message.content[:6000]}" for message in admissible
     )[-50_000:]
+    if persisted_context:
+        transcript = (
+            f"{transcript}\n\nPERSISTED VALIDATION AND EVIDENCE:\n{persisted_context}"
+        )[-70_000:]
     try:
         data = await asyncio.wait_for(
             AsyncLLMClient().generate_validation(
@@ -206,10 +266,13 @@ async def assess_conversation(messages: list[ChatMessage]) -> ReportReadinessRes
             ),
             timeout=55,
         )
-        return score_report_draft(ReportDraft(**_normalize_extraction(data)))
+        extracted = ReportDraft(**_normalize_extraction(data))
+        return score_report_draft(_merge_known_facts(extracted, baseline))
     except Exception as exc:
         log.warning("Structured readiness extraction unavailable: %s", exc)
-        result = score_report_draft(_fallback_draft(user_text))
+        result = score_report_draft(
+            _merge_known_facts(_fallback_draft(user_text), baseline)
+        )
         result.assessment_notice = (
             "Structured AI extraction is temporarily unavailable. This conservative assessment "
             "preserves the analyst's text as source material and leaves unverified fields incomplete."

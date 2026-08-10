@@ -221,6 +221,25 @@ class ChatRequest(BaseModel):
     action: Optional[str] = None
     title: Optional[str] = None
 
+class ConversationState(BaseModel):
+    title: Optional[str] = None
+    messages: List[dict] = []
+    validation_snapshot: Optional[dict] = None
+    readiness_snapshot: Optional[dict] = None
+    finding_id: Optional[str] = None
+
+class ConversationOut(BaseModel):
+    id: str
+    title: str
+    messages: List[dict] = []
+    validation_snapshot: Optional[dict] = None
+    readiness_snapshot: Optional[dict] = None
+    finding_id: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    class Config:
+        from_attributes = True
+
 class KBEntryCreate(BaseModel):
     entry_type: str
     title: str

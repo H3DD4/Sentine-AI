@@ -2,12 +2,18 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from app.db import get_session
 from app.config import settings
 from app.models import AuditLog, Finding, GeneratedReport, ReportTemplate
 from app.schemas import ChatRequest, GeneratedReportOut, ReportRequest, ReportTemplateOut
 from app.services.report import generate_report_docx
-from app.services.report_readiness import assess_conversation, draft_to_finding
+from app.services.report_readiness import (
+    assess_conversation,
+    draft_to_finding,
+    finding_evidence_context,
+    finding_report_draft,
+)
 import hashlib
 import os
 import uuid
@@ -139,11 +145,46 @@ async def delete_report(
 
 
 @router.post("/readiness")
-async def assess_report_readiness(req: ChatRequest):
+async def assess_report_readiness(
+    req: ChatRequest,
+    session: AsyncSession = Depends(get_session),
+):
     if not req.messages:
         raise HTTPException(400, "At least one conversation message is required")
+    persisted_context = ""
+    baseline = None
+    if req.finding_id:
+        result = await session.execute(
+            select(Finding)
+            .options(selectinload(Finding.evidence))
+            .where(Finding.id == req.finding_id)
+        )
+        finding = result.scalar_one_or_none()
+        if not finding:
+            raise HTTPException(404, "Finding not found")
+        persisted_context = finding_evidence_context(finding, list(finding.evidence))
+        baseline = finding_report_draft(finding, list(finding.evidence))
     try:
-        return await assess_conversation(req.messages)
+        assessment = await assess_conversation(req.messages, persisted_context, baseline)
+        if req.finding_id and finding:
+            draft = assessment.draft
+            for field in (
+                "affected_scope",
+                "technical_evidence",
+                "reproduction_steps",
+                "impact",
+                "severity",
+                "cvss_score",
+                "cvss_vector",
+                "matched_cves",
+                "matched_techniques",
+            ):
+                current = getattr(finding, field)
+                value = getattr(draft, field)
+                if not current and value:
+                    setattr(finding, field, value)
+            await session.commit()
+        return assessment
     except Exception as exc:
         raise HTTPException(502, f"Could not assess report readiness: {exc}") from exc
 

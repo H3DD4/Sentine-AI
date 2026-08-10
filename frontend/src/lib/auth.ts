@@ -12,9 +12,7 @@ const USER_KEY = "sentinel.auth.user";
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ??
-  (typeof window !== "undefined" && window.location.port !== "8000" && window.location.port !== ""
-    ? "http://localhost:8000"
-    : "");
+  "http://localhost:8000";
 
 export interface AuthUser {
   id: string;
@@ -90,7 +88,13 @@ export async function authLogin(email: string, password: string): Promise<AuthUs
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error((err as { detail?: string }).detail ?? "Login failed");
+    let errMsg = "Login failed";
+    if (Array.isArray(err.detail) && err.detail.length > 0) {
+      errMsg = err.detail[0].msg;
+    } else if (typeof err.detail === "string") {
+      errMsg = err.detail;
+    }
+    throw new Error(errMsg);
   }
 
   const data = (await res.json()) as {
@@ -123,7 +127,13 @@ export async function authRegister(
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error((err as { detail?: string }).detail ?? "Registration failed");
+    let errMsg = "Registration failed";
+    if (Array.isArray(err.detail) && err.detail.length > 0) {
+      errMsg = err.detail[0].msg;
+    } else if (typeof err.detail === "string") {
+      errMsg = err.detail;
+    }
+    throw new Error(errMsg);
   }
   return (await res.json()) as AuthUser;
 }
@@ -165,20 +175,23 @@ export function authLogout(): void {
  */
 export async function apiFetch(input: string | URL, init?: RequestInit): Promise<Response> {
   const token = getAccessToken();
-  const headers = new Headers(init?.headers);
+  const send = (accessToken: string | null) => {
+    const headers = new Headers(init?.headers);
+    if (accessToken && !headers.has("Authorization")) {
+      headers.set("Authorization", `Bearer ${accessToken}`);
+    }
+    return fetch(input, { ...init, headers });
+  };
 
-  if (token && !headers.has("Authorization")) {
-    headers.set("Authorization", `Bearer ${token}`);
-  }
-
-  let res = await fetch(input, { ...init, headers });
+  let res = await send(token);
 
   // On 401 try to refresh once
   if (res.status === 401 && getRefreshToken()) {
     const newToken = await authRefresh();
     if (newToken) {
-      headers.set("Authorization", `Bearer ${newToken}`);
-      res = await fetch(input, { ...init, headers });
+      // Build a fresh request for the retry. This is required for multipart
+      // uploads because a fetch request body may have been consumed already.
+      res = await send(newToken);
     } else {
       // Refresh also failed — force login
       clearSession();

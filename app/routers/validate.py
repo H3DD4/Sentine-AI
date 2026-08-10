@@ -8,7 +8,7 @@ Changes:
 - Paginated findings already handled elsewhere
 """
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
 from app.schemas import ValidationResponse
@@ -20,21 +20,30 @@ from app.services.upload_processing import (
 )
 from app.models import Finding, Evidence, AuditLog
 import hashlib
+import time
 
 router = APIRouter(prefix="/validate", tags=["validation"])
 
 @router.post("", response_model=ValidationResponse)
 async def validate_endpoint(
+    response: Response,
     title: str = Form(...),
     description: str = Form(...),
     files: list[UploadFile] = File(default=[]),
     session: AsyncSession = Depends(get_session),
 ):
+    request_started = time.perf_counter()
     parsed_evidence, processing = await stage_evidence_uploads(files)
+    processing_finished = time.perf_counter()
     evidence_texts = [p["analysis_text"] for p in parsed_evidence if p.get("analysis_text")]
     image_descriptions = [
         p["image_description"] for p in parsed_evidence if p["image_description"]
     ]
+    persisted_evidence = "\n\n".join(
+        f"{item['filename']}:\n{content}"
+        for item in parsed_evidence
+        if (content := item.get("image_description") or item.get("extracted_text"))
+    )[:32_000]
 
     # Run AI validation. The search outcome comes back alongside the verdict
     # so the response can state which corpora backed it.
@@ -42,6 +51,7 @@ async def validate_endpoint(
         result, outcome = await validate_finding(
             description, evidence_texts, image_descriptions, session
         )
+        validation_finished = time.perf_counter()
     except Exception:
         cleanup_staged_evidence(parsed_evidence)
         raise
@@ -53,6 +63,7 @@ async def validate_endpoint(
         verdict=result.verdict,
         confidence=result.confidence,
         reasoning=result.reasoning,
+        technical_evidence=persisted_evidence,
         matched_cves=result.matched_cves,
         matched_techniques=result.matched_techniques,
         missing_evidence=result.missing_evidence,
@@ -94,12 +105,18 @@ async def validate_endpoint(
             },
         ))
         await session.commit()
+        persistence_finished = time.perf_counter()
     except Exception:
         cleanup_staged_evidence(parsed_evidence)
         await session.rollback()
         raise
 
     data = outcome.to_dict()
+    response.headers["Server-Timing"] = (
+        f"evidence;dur={(processing_finished - request_started) * 1000:.0f}, "
+        f"validation;dur={(validation_finished - processing_finished) * 1000:.0f}, "
+        f"persistence;dur={(persistence_finished - validation_finished) * 1000:.0f}"
+    )
     return ValidationResponse(
         **result.model_dump(),
         finding_id=finding.id,

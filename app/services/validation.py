@@ -18,11 +18,13 @@ grounded in retrieved data.
    which is exactly the behaviour this knowledge base exists to replace.
 """
 
+import asyncio
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.kb.base import SearchOutcome
+from app.config import settings
 from app.schemas import ValidationResult
 from app.services.llm_client import AsyncLLMClient
 from app.services.retrieval import multimodal_search
@@ -172,6 +174,7 @@ async def validate_finding(
         session,
         evidence_texts=evidence_texts,
         image_descriptions=image_descriptions,
+        rerank=True,
     )
 
     # 2. Build the context and coverage blocks.
@@ -218,11 +221,12 @@ Validate this finding and return your JSON verdict."""
 
     # 4. Call the LLM.
     client = AsyncLLMClient()
-    data = await client.generate_validation(
-        system=VALIDATION_SYSTEM,
-        user_message=user_message,
-        max_tokens=1500,
-    )
+    async with asyncio.timeout(settings.VALIDATION_STAGE_TIMEOUT_SECONDS):
+        data = await client.generate_validation(
+            system=VALIDATION_SYSTEM,
+            user_message=user_message,
+            max_tokens=1500,
+        )
 
     result = ValidationResult(**data)
 
@@ -243,4 +247,5 @@ Validate this finding and return your JSON verdict."""
 async def describe_image(image_bytes: bytes, media_type: str) -> str:
     """Use vision model to extract text/context from an uploaded screenshot."""
     client = AsyncLLMClient()
-    return await client.describe_image(image_bytes, media_type)
+    async with asyncio.timeout(settings.VISION_STAGE_TIMEOUT_SECONDS):
+        return await client.describe_image(image_bytes, media_type)

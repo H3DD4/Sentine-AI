@@ -5,8 +5,8 @@ import { SeverityBadge, VerdictBadge } from "@/components/brand/Badges";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { useQuery } from "@tanstack/react-query";
-import { listFindings, listEngagements } from "@/lib/api";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { deleteConversation, listConversations, listFindings, listEngagements } from "@/lib/api";
 import type { Finding, Engagement, Severity } from "@/lib/api";
 import {
   StatsGridSkeleton,
@@ -14,11 +14,12 @@ import {
   TableSkeleton,
 } from "@/components/ui/loading-skeletons";
 import { toast } from "sonner";
-import { Plus, ArrowUpRight, Activity, ShieldAlert, Target, Zap } from "lucide-react";
+import { Plus, ArrowUpRight, Activity, ShieldAlert, Target, Zap, MessageSquare, Trash2 } from "lucide-react";
 
 export const Route = createFileRoute("/")({ component: Dashboard });
 
 function Dashboard() {
+  const queryClient = useQueryClient();
   const { data: findings = [], isLoading: findingsLoading } = useQuery<Finding[]>({
     queryKey: ["findings"],
     queryFn: () => listFindings(0),
@@ -33,6 +34,11 @@ function Dashboard() {
     refetchInterval: 30_000,
     refetchIntervalInBackground: false,
     staleTime: 10_000,
+  });
+
+  const { data: conversations = [] } = useQuery({
+    queryKey: ["conversations"],
+    queryFn: listConversations,
   });
 
   const activeEngagements = engagementsData.filter((e) => e.status === "active").length;
@@ -135,7 +141,7 @@ function Dashboard() {
               <Link to="/knowledge">Knowledge base</Link>
             </Button>
             <Button asChild>
-              <Link to="/chat">
+              <Link to="/chat" search={{ new: true } as never}>
                 <Plus className="h-4 w-4 mr-1.5" />
                 New Finding
               </Link>
@@ -308,6 +314,62 @@ function Dashboard() {
             </div>
           </Card>
         </div>
+
+        <Card className="border-border bg-white p-5 shadow-soft">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <div className="text-xs font-semibold text-brand-cyan">Workspace memory</div>
+              <h2 className="text-lg font-semibold">Previous analyses</h2>
+            </div>
+            <Button size="sm" asChild>
+              <Link to="/chat" search={{ new: true } as never}>
+                <Plus className="mr-1.5 h-4 w-4" />
+                New analysis
+              </Link>
+            </Button>
+          </div>
+          {conversations.length === 0 ? (
+            <p className="py-6 text-sm text-muted-foreground">
+              Your saved conversations will appear here.
+            </p>
+          ) : (
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {conversations.slice(0, 9).map((conversation) => (
+                <div
+                  key={conversation.id}
+                  className="group flex items-start gap-3 border border-border p-3 hover:border-brand-cyan"
+                >
+                  <MessageSquare className="mt-0.5 h-4 w-4 shrink-0 text-brand-cyan" />
+                  <Link
+                    to="/chat"
+                    search={{ conversation: conversation.id } as never}
+                    className="min-w-0 flex-1"
+                  >
+                    <div className="truncate text-sm font-semibold">{conversation.title}</div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      Updated {new Date(conversation.updated_at).toLocaleString()}
+                    </div>
+                    {conversation.finding_id && (
+                      <div className="mt-1 text-[11px] text-verdict-confirmed">
+                        Validated finding attached
+                      </div>
+                    )}
+                  </Link>
+                  <button
+                    className="text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive"
+                    onClick={async () => {
+                      await deleteConversation(conversation.id);
+                      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+                    }}
+                    aria-label={`Delete ${conversation.title}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
       </div>
     </AppShell>
   );

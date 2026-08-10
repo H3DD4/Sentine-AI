@@ -347,20 +347,38 @@ class AsyncLLMClient:
 
     async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
         p = self.provider
-        m = _get_model(p, "vision")
+        models = [_get_model(p, "vision")]
+        if p == LLMProvider.openrouter:
+            models.extend(settings.OPENROUTER_VISION_FALLBACK_MODELS)
+        models = list(dict.fromkeys(model for model in models if model))
 
-        async def _call():
-            if p == LLMProvider.anthropic:
-                return await self._describe_image_anthropic(image_bytes, media_type, m)
-            elif p in (LLMProvider.openai, LLMProvider.together,
-                       LLMProvider.openrouter, LLMProvider.ollama):
-                return await self._describe_image_openai_compat(image_bytes, media_type, m, p)
-            elif p == LLMProvider.gemini:
-                return await self._describe_image_gemini(image_bytes, media_type, m)
-            else:
-                return "(Vision not supported for this provider)"
+        last_error: Exception | None = None
+        for model in models:
+            try:
+                async def _call():
+                    if p == LLMProvider.anthropic:
+                        return await self._describe_image_anthropic(image_bytes, media_type, model)
+                    if p in (
+                        LLMProvider.openai,
+                        LLMProvider.together,
+                        LLMProvider.openrouter,
+                        LLMProvider.ollama,
+                    ):
+                        return await self._describe_image_openai_compat(
+                            image_bytes, media_type, model, p
+                        )
+                    if p == LLMProvider.gemini:
+                        return await self._describe_image_gemini(image_bytes, media_type, model)
+                    raise ValueError(f"Vision not supported for provider: {p}")
 
-        return await _with_retry(_call)
+                return await _with_retry(_call, retries=2)
+            except Exception as exc:
+                last_error = exc
+                log.warning("Vision model %s failed: %s", model, exc)
+
+        raise RuntimeError(
+            f"All configured vision models failed for provider {p.value}"
+        ) from last_error
 
     _VISION_PROMPT = (
         "You are a security analyst. Extract all text visible in this image "

@@ -13,21 +13,22 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings
 from app.db import engine, Base, get_session_context
-from app.routers import chat, report, validate, findings, ghostwriter, kb, engagements, auth
+from app.routers import chat, report, validate, findings, ghostwriter, kb, engagements, auth, conversations
 from app.routers import settings as settings_router, audit
 from app.ingestion.nvd_sync import sync_nvd
 from app.ingestion.mitre_sync import sync_mitre
 from app.ingestion.embedder import load_model_sync, load_sparse_model_sync
 from app.kb.indexer import ensure_all_collections
 from app.kb.registry import all_sources, check_all_sources
-from app.services.retrieval import init_qdrant_client, get_qdrant
+from app.services.retrieval import init_qdrant_client, get_qdrant, load_reranker_sync
 from app.auth import get_current_active_user
 import logging
 import os
@@ -61,6 +62,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         # Retrieval degrades to dense-only rather than failing.
         log.warning("Sparse (BM25) model load failed: %s — dense-only retrieval", exc)
+
+    # Warm the cross-encoder before the first analyst request. Multimodal
+    # validation reranks once after fusion, with a strict request budget.
+    if settings.RERANK_ENABLED:
+        try:
+            load_reranker_sync()
+        except Exception as exc:
+            log.warning("Reranker warm-up failed: %s — RRF fallback", exc)
 
     # 3. Qdrant: one collection per knowledge source.
     try:
@@ -131,6 +140,15 @@ async def _verify_schema() -> None:
 
 limiter = Limiter(key_func=get_remote_address)
 
+
+class APIErrorMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        try:
+            return await call_next(request)
+        except Exception:
+            log.exception("Unhandled error while serving %s %s", request.method, request.url.path)
+            return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 app = FastAPI(
     title="Forvis Mazars Red Team RAG",
     version="2.0.0",
@@ -141,11 +159,18 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Convert unexpected failures into a response before the outer CORS middleware
+# runs, so browsers expose the real HTTP error instead of reporting a CORS block.
+app.add_middleware(APIErrorMiddleware)
+
 # CORS — driven by settings.CORS_ORIGINS (see .env: CORS_ORIGINS=[...]).
 # Add new origins there rather than hardcoding here.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+    if settings.CORS_ALLOW_LOCALHOST
+    else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -164,6 +189,7 @@ app.include_router(kb.router, dependencies=protected)
 app.include_router(engagements.router, dependencies=protected)
 app.include_router(settings_router.router, dependencies=protected)
 app.include_router(audit.router, dependencies=protected)
+app.include_router(conversations.router, dependencies=protected)
 
 # ── Static files + SPA fallback ───────────────────────────────────────────────
 

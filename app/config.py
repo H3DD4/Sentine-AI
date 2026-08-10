@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # pipeline, but it costs ~50-150ms per query on CPU. Disable to trade
     # precision for latency.
     RERANK_ENABLED: bool = True
+    RERANK_CANDIDATES: int = 15
+    RERANK_TIMEOUT_SECONDS: float = 3.0
     # Whether model loading may reach the network.
     #
     # Off by default, and that default is deliberate: a model that is not in
@@ -44,6 +46,8 @@ class Settings(BaseSettings):
     # LLM Provider Selection
     LLM_PROVIDER: LLMProvider = LLMProvider.anthropic
     LLM_REQUEST_TIMEOUT_SECONDS: float = 45.0
+    VISION_STAGE_TIMEOUT_SECONDS: float = 30.0
+    VALIDATION_STAGE_TIMEOUT_SECONDS: float = 45.0
 
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
@@ -67,8 +71,11 @@ class Settings(BaseSettings):
     # OpenRouter
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_CHAT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    OPENROUTER_VALIDATION_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    OPENROUTER_VISION_MODEL: str = "microsoft/phi-3-vision-128k-instruct:free"
+    OPENROUTER_VALIDATION_MODEL: str = "google/gemini-2.5-flash-lite"
+    OPENROUTER_VISION_MODEL: str = "google/gemini-2.5-flash-lite"
+    OPENROUTER_VISION_FALLBACK_MODELS: list[str] = [
+        "nvidia/nemotron-nano-12b-v2-vl:free"
+    ]
 
     # Ollama (local)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
@@ -118,6 +125,9 @@ class Settings(BaseSettings):
     # App
     API_KEY: str = "change-me"
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:8003"]
+    # Development-only convenience: allow any local browser port. Production
+    # deployments should keep CORS_ORIGINS explicit and disable this flag.
+    CORS_ALLOW_LOCALHOST: bool = True
     UPLOAD_DIR: str = "/tmp/redteam_evidence"
     REPORT_DIR: str = "/tmp/redteam_reports"
     REPORT_TEMPLATE_DIR: str = "/tmp/redteam_report_templates"

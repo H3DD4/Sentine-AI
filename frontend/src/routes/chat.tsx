@@ -11,6 +11,9 @@ import { useRef, useState, useCallback, useEffect } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   assessReportReadiness,
+  createConversation,
+  getConversation,
+  updateConversation,
   getSources,
   REPORT_HANDOFF_STORAGE_KEY,
   streamChatMessage,
@@ -74,6 +77,15 @@ type Msg = {
 // but a new tab starts clean and nothing is left on a shared analyst
 // workstation after the browser closes.
 const CHAT_STORAGE_KEY = "sentinel.chat.v1";
+const CHAT_STATE_STORAGE_KEY = "sentinel.chat.state.v1";
+
+type StoredChatState = {
+  validation: ValidationResponse | null;
+  readiness: ReportReadiness | null;
+  readinessFindingId: string | null;
+  conversationId: string | null;
+  conversationTitle: string | null;
+};
 
 function loadStoredMessages(): Msg[] {
   try {
@@ -88,6 +100,68 @@ function loadStoredMessages(): Msg[] {
     // Corrupt or unreadable storage must never take the page down — an empty
     // transcript is a recoverable state, a crashed route is not.
     return [];
+  }
+}
+
+function loadStoredChatState(): StoredChatState {
+  const blank: StoredChatState = {
+    validation: null,
+    readiness: null,
+    readinessFindingId: null,
+    conversationId: null,
+    conversationTitle: null,
+  };
+  try {
+    const raw = sessionStorage.getItem(CHAT_STATE_STORAGE_KEY);
+    if (!raw) return blank;
+    const parsed = JSON.parse(raw) as Partial<StoredChatState>;
+    const validation = parsed.validation ?? null;
+    const readinessFindingId = parsed.readinessFindingId ?? null;
+    return {
+      validation,
+      // Old snapshots did not record which persisted finding supplied the
+      // assessment. Discard that stale score rather than showing a transcript-
+      // only assessment beside restored screenshot evidence.
+      readiness:
+        validation?.finding_id && readinessFindingId !== validation.finding_id
+          ? null
+          : (parsed.readiness ?? null),
+      readinessFindingId,
+      conversationId: parsed.conversationId ?? null,
+      conversationTitle: parsed.conversationTitle ?? null,
+    };
+  } catch {
+    return blank;
+  }
+}
+
+/**
+ * Read-modify-write one field of the stored state.
+ *
+ * The conversation id has to reach sessionStorage the *instant* the server
+ * issues it, not on React's next effect pass. Waiting for a render is what
+ * made the row duplicate: navigate away in that gap and the transcript comes
+ * back with no id attached, which reads as "never saved" and creates a second
+ * copy of the same conversation.
+ */
+function patchStoredChatState(patch: Partial<StoredChatState>) {
+  try {
+    sessionStorage.setItem(
+      CHAT_STATE_STORAGE_KEY,
+      JSON.stringify({ ...loadStoredChatState(), ...patch }),
+    );
+  } catch {
+    // Storage disabled or over quota — in-memory state still holds the id.
+  }
+}
+
+function clearStoredConversation() {
+  try {
+    sessionStorage.removeItem(CHAT_STORAGE_KEY);
+    sessionStorage.removeItem(CHAT_STATE_STORAGE_KEY);
+    sessionStorage.removeItem(REPORT_HANDOFF_STORAGE_KEY);
+  } catch {
+    // Non-fatal; callers clear their in-memory state regardless.
   }
 }
 
@@ -135,6 +209,13 @@ function ChatPage() {
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
   const [readiness, setReadiness] = useState<ReportReadiness | null>(null);
+  const [analysisElapsed, setAnalysisElapsed] = useState(0);
+  const [isAnalyzingEvidence, setIsAnalyzingEvidence] = useState(false);
+  const [analysisFiles, setAnalysisFiles] = useState<string[]>([]);
+  const [isWaitingForFirstToken, setIsWaitingForFirstToken] = useState(false);
+  const [waitingElapsed, setWaitingElapsed] = useState(0);
+  const [conversationTitle, setConversationTitle] = useState("Untitled analysis");
+  const [conversationLoaded, setConversationLoaded] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -142,6 +223,34 @@ function ChatPage() {
   const stopStreamRef = useRef<(() => void) | null>(null);
   const streamInFlightRef = useRef(false);
   const followLatestRef = useRef(true);
+  /**
+   * The authoritative conversation id — the single source of truth.
+   *
+   * A ref, not state, because the debounced save reads it at *fire* time.
+   * Reading a `conversationId` state value from the effect closure meant a
+   * save scheduled before the id came back still saw `null` and POSTed a
+   * second conversation — the duplicate row. Nothing renders the id, so
+   * holding it in state bought nothing and cost correctness.
+   */
+  const conversationIdRef = useRef<string | null>(null);
+  /**
+   * Bumped whenever the analyst starts a new conversation.
+   *
+   * Guards against a save that was already in flight when they hit "New chat":
+   * its POST resolves afterwards and would otherwise write the *old*
+   * transcript's id onto the blank session, so the first message of the new
+   * analysis would silently overwrite the previous conversation's row.
+   */
+  const conversationEpochRef = useRef(0);
+  /**
+   * The POST that is currently creating this conversation, if any.
+   *
+   * Without it, two saves can overlap: the first POST is still in flight (slow
+   * link, large transcript) when the debounce fires again, the id is still
+   * null, and a second conversation is created for the same transcript. Later
+   * saves chain onto this promise instead of racing it.
+   */
+  const savingRef = useRef<Promise<unknown> | null>(null);
 
   // Source health, polled independently of the conversation. The analyst needs
   // to know a corpus is down *before* asking a question that depends on it,
@@ -192,11 +301,88 @@ function ChatPage() {
     });
   }, []);
 
-  // Browser storage is restored after hydration so the server and the first
-  // client render always produce identical markup.
+  /**
+   * Restore, resume, or start fresh — in one effect.
+   *
+   * This used to be two effects that both ran on mount and fought each other:
+   * one restored sessionStorage, the other loaded `?conversation=`. Nothing
+   * sequenced them, so a slow GET could land after the restore and clobber it,
+   * or the restore could win and leave the resumed conversation's id unset —
+   * and an unset id is exactly what makes the next save create a duplicate.
+   */
   useEffect(() => {
+    let active = true;
+    const params = new URLSearchParams(window.location.search);
+    const isNew = params.get("new") === "true";
+    const resumeId = params.get("conversation");
+
+    // Strip the one-shot params so a refresh does not re-trigger them: `new`
+    // would wipe the transcript the analyst just wrote, and `conversation`
+    // would fight a subsequent "New chat".
+    if (isNew || resumeId) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("new");
+      url.searchParams.delete("conversation");
+      window.history.replaceState({}, "", url);
+    }
+
+    if (isNew) {
+      clearStoredConversation();
+      conversationEpochRef.current += 1;
+      conversationIdRef.current = null;
+      setMessages([]);
+      setLastValidation(null);
+      setReadiness(null);
+      setConversationTitle("Untitled analysis");
+      setStorageLoaded(true);
+      setConversationLoaded(true);
+      return;
+    }
+
+    if (resumeId) {
+      // Adopt the id before the request resolves. If the analyst navigates
+      // away mid-flight, the transcript is already bound to the row it came
+      // from, so the next save updates it instead of creating a copy.
+      conversationIdRef.current = resumeId;
+      patchStoredChatState({ conversationId: resumeId });
+      getConversation(resumeId)
+        .then((conversation) => {
+          if (!active) return;
+          conversationIdRef.current = conversation.id;
+          setConversationTitle(conversation.title);
+          setMessages(conversation.messages as Msg[]);
+          setLastValidation(conversation.validation_snapshot);
+          setReadiness(conversation.readiness_snapshot);
+        })
+        .catch(() => {
+          if (!active) return;
+          // The row is gone or belongs to someone else. Detach rather than
+          // keep saving into an id that will 404 on every future write.
+          conversationIdRef.current = null;
+          toast.error("Could not resume conversation");
+        })
+        .finally(() => {
+          if (!active) return;
+          setStorageLoaded(true);
+          setConversationLoaded(true);
+        });
+      return;
+    }
+
+    const storedState = loadStoredChatState();
     setMessages(loadStoredMessages());
+    setLastValidation(storedState.validation);
+    setReadiness(storedState.readiness);
+    conversationIdRef.current = storedState.conversationId;
+    if (storedState.conversationTitle) {
+      setConversationTitle(storedState.conversationTitle);
+    }
     setStorageLoaded(true);
+    setConversationLoaded(true);
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Persist the transcript so navigating away and back does not lose it.
@@ -206,11 +392,87 @@ function ChatPage() {
     if (!storageLoaded) return;
     try {
       sessionStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages));
+      sessionStorage.setItem(
+        CHAT_STATE_STORAGE_KEY,
+        JSON.stringify({
+          validation: lastValidation,
+          readiness,
+          readinessFindingId: readiness ? (lastValidation?.finding_id ?? null) : null,
+          // From the ref, not the state: a save that resolved microseconds ago
+          // has already written the id here, and reading the (still stale)
+          // state value would overwrite it back to null.
+          conversationId: conversationIdRef.current,
+          conversationTitle,
+        }),
+      );
     } catch {
       // Quota exceeded or storage disabled. The conversation still works in
       // memory; only persistence is lost, which is not worth interrupting for.
     }
-  }, [messages, storageLoaded]);
+  }, [conversationTitle, lastValidation, messages, readiness, storageLoaded]);
+
+  useEffect(() => {
+    if (
+      !storageLoaded ||
+      !conversationLoaded ||
+      (!messages.length && !lastValidation && !readiness)
+    )
+      return;
+    const timer = window.setTimeout(() => {
+      const state = {
+        title:
+          conversationTitle === "Untitled analysis"
+            ? (messages[0]?.text || "Untitled analysis").slice(0, 100)
+            : conversationTitle,
+        messages,
+        validation_snapshot: lastValidation,
+        readiness_snapshot: readiness,
+        finding_id: lastValidation?.finding_id ?? null,
+      };
+
+      // Chain onto any save still in flight. Two concurrent saves with no id
+      // yet would each POST, and the second row is the duplicate the analyst
+      // sees in History.
+      const run = async () => {
+        const epoch = conversationEpochRef.current;
+        try {
+          const existingId = conversationIdRef.current;
+          if (existingId) {
+            const saved = await updateConversation(existingId, state);
+            if (epoch !== conversationEpochRef.current) return;
+            setConversationTitle(saved.title);
+            return;
+          }
+          const saved = await createConversation(state);
+          // The analyst hit "New chat" while this POST was in flight. Adopting
+          // the id now would bind the *previous* transcript's row to the blank
+          // session, and the next keystroke would overwrite it.
+          if (epoch !== conversationEpochRef.current) return;
+          // Written before any React state update, so a navigation on the very
+          // next tick still finds the id.
+          conversationIdRef.current = saved.id;
+          patchStoredChatState({ conversationId: saved.id, conversationTitle: saved.title });
+          setConversationTitle(saved.title);
+        } catch {
+          // Local session storage remains available if the server is offline.
+        }
+      };
+
+      const chained = (savingRef.current ?? Promise.resolve()).then(run, run);
+      savingRef.current = chained;
+      chained.finally(() => {
+        if (savingRef.current === chained) savingRef.current = null;
+      });
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [
+    conversationLoaded,
+    conversationTitle,
+    lastValidation,
+    messages,
+    readiness,
+    storageLoaded,
+  ]);
 
   /**
    * Start a fresh conversation.
@@ -228,13 +490,14 @@ function ChatPage() {
     setInput("");
     setIsStreaming(false);
     setReadiness(null);
-    try {
-      sessionStorage.removeItem(CHAT_STORAGE_KEY);
-      sessionStorage.removeItem(REPORT_HANDOFF_STORAGE_KEY);
-    } catch {
-      // Non-fatal; state is already cleared in memory.
-    }
-  }, []);
+    setIsAnalyzingEvidence(false);
+    setAnalysisFiles([]);
+    conversationEpochRef.current += 1;
+    conversationIdRef.current = null;
+    setConversationTitle("Untitled analysis");
+    navigate({ to: "/chat", search: {} as never, replace: true });
+    clearStoredConversation();
+  }, [navigate]);
 
   const reportMessages = useCallback(
     () =>
@@ -291,7 +554,18 @@ function ChatPage() {
       title: string;
       description: string;
       evidenceFiles: File[];
-    }) => validateFinding(title, description, evidenceFiles),
+    }) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 90_000);
+      return validateFinding(title, description, evidenceFiles, controller.signal)
+        .catch((error) => {
+          if (error instanceof DOMException && error.name === "AbortError") {
+            throw new Error("Evidence analysis exceeded 90 seconds. Please try again.");
+          }
+          throw error;
+        })
+        .finally(() => window.clearTimeout(timeout));
+    },
     onSuccess: (result) => {
       setLastValidation(result);
       const summaryText =
@@ -334,12 +608,35 @@ function ChatPage() {
       }
       scrollToBottom();
     },
+    onMutate: ({ evidenceFiles }) => {
+      setIsAnalyzingEvidence(true);
+      setAnalysisFiles(evidenceFiles.map((file) => file.name));
+      setAnalysisElapsed(0);
+    },
     onError: (error) => {
       toast.error("Validation failed", {
         description: error instanceof Error ? error.message : "Could not validate finding.",
       });
     },
+    onSettled: () => {
+      setIsAnalyzingEvidence(false);
+      setAnalysisFiles([]);
+    },
   });
+
+  useEffect(() => {
+    if (!isAnalyzingEvidence) {
+      setAnalysisElapsed(0);
+      return;
+    }
+
+    const startedAt = Date.now();
+    scrollToBottom();
+    const timer = window.setInterval(() => {
+      setAnalysisElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isAnalyzingEvidence, scrollToBottom]);
 
   const {
     mutate: assessReadiness,
@@ -347,7 +644,8 @@ function ChatPage() {
     isPending: readinessLoading,
     error: readinessError,
   } = useMutation({
-    mutationFn: (conversation: ChatMessage[]) => assessReportReadiness(conversation),
+    mutationFn: (conversation: ChatMessage[]) =>
+      assessReportReadiness(conversation, lastValidation?.finding_id),
     onSuccess: setReadiness,
     onError: (error) => {
       toast.error("Report readiness could not be assessed", {
@@ -399,13 +697,21 @@ function ChatPage() {
       const aiMsgId = crypto.randomUUID();
       setMessages((prev) => [...prev, { id: aiMsgId, from: "ai", text: "", streaming: true }]);
       setIsStreaming(true);
+      setIsWaitingForFirstToken(false);
+      setWaitingElapsed(0);
       scrollToBottom();
 
       let accumulated = "";
+      let firstTokenReceived = false;
 
       const stop = streamChatMessage(
         chatMessages,
         (token) => {
+          if (!firstTokenReceived) {
+            firstTokenReceived = true;
+            setIsWaitingForFirstToken(false);
+            setWaitingElapsed(0);
+          }
           accumulated += token;
           setMessages((prev) =>
             prev.map((m) => (m.id === aiMsgId ? { ...m, text: accumulated } : m)),
@@ -413,6 +719,8 @@ function ChatPage() {
           followStream();
         },
         () => {
+          setIsWaitingForFirstToken(false);
+          setWaitingElapsed(0);
           setMessages((prev) => {
             if (!accumulated.trim()) return prev.filter((m) => m.id !== aiMsgId);
             return prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m));
@@ -422,6 +730,8 @@ function ChatPage() {
           stopStreamRef.current = null;
         },
         (err) => {
+          setIsWaitingForFirstToken(false);
+          setWaitingElapsed(0);
           toast.error("Chat failed", { description: err.message });
           setMessages((prev) => prev.filter((m) => m.id !== aiMsgId));
           setIsStreaming(false);
@@ -429,12 +739,17 @@ function ChatPage() {
           stopStreamRef.current = null;
         },
         undefined,
-        // Arrives before the first token, so the source strip is already on
-        // screen while the answer is still being written.
+        // Sources frame arrives after retrieval (~8s), before LLM responds (~60s).
+        // Use it to flip into the "waiting for LLM" state.
         (provenance) => {
           setMessages((prev) => prev.map((m) => (m.id === aiMsgId ? { ...m, provenance } : m)));
+          if (!firstTokenReceived) {
+            setIsWaitingForFirstToken(true);
+          }
         },
         () => {
+          setIsWaitingForFirstToken(false);
+          setWaitingElapsed(0);
           setMessages((prev) => {
             if (!accumulated.trim()) return prev.filter((m) => m.id !== aiMsgId);
             return prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m));
@@ -494,7 +809,20 @@ function ChatPage() {
     }
   }, [input, files, messages, isStreaming, validateMutation, sendStream, scrollToBottom]);
 
-  const isLoading = isStreaming || validateMutation.isPending;
+  // Tick a waiting-for-LLM elapsed counter so the user knows the AI is queuing.
+  useEffect(() => {
+    if (!isWaitingForFirstToken) {
+      setWaitingElapsed(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setWaitingElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isWaitingForFirstToken]);
+
+  const isLoading = isStreaming || isAnalyzingEvidence;
 
   return (
     <AppShell>
@@ -678,7 +1006,22 @@ function ChatPage() {
                       )}
                     >
                       {m.from === "ai" ? (
-                        <MarkdownText text={m.text || "…"} />
+                        isWaitingForFirstToken && m.streaming && !m.text ? (
+                          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                            <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand-cyan" />
+                            <span>
+                              Thinking
+                              {waitingElapsed > 0 && (
+                                <span className="ml-1 tabular-nums text-xs">({waitingElapsed}s)</span>
+                              )}
+                              {waitingElapsed > 30 && (
+                                <span className="ml-1 text-xs text-amber-600"> — model is queuing, please wait…</span>
+                              )}
+                            </span>
+                          </div>
+                        ) : (
+                          <MarkdownText text={m.text || "…"} />
+                        )
                       ) : (
                         <span className="whitespace-pre-wrap">{m.text}</span>
                       )}
@@ -716,6 +1059,48 @@ function ChatPage() {
                   )}
                 </div>
               ))}
+
+              {isAnalyzingEvidence && (
+                <div className="flex gap-3" role="status" aria-live="polite">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center bg-brand-navy">
+                    <Bot className="h-4 w-4 text-white" />
+                  </div>
+                  <div className="max-w-[82%] md:max-w-[76%]">
+                    <div className="mb-1.5 flex items-center gap-2 text-xs font-semibold text-muted-foreground">
+                      <Sparkles className="h-3 w-3 text-brand-cyan" />
+                      Sentinel
+                      <span className="inline-block h-2 w-2 rounded-full bg-brand-cyan animate-pulse" />
+                    </div>
+                    <div className="border border-border bg-muted/50 px-4 py-3">
+                      <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand-cyan" />
+                        Analyzing attached evidence
+                        <span className="text-xs font-normal tabular-nums text-muted-foreground">
+                          {analysisElapsed}s
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+                        {analysisElapsed < 30
+                          ? "Reading the image or file and extracting security evidence."
+                          : analysisElapsed < 55
+                            ? "Searching approved knowledge sources for relevant guidance."
+                            : "Preparing the grounded validation result."}
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {analysisFiles.map((file) => (
+                          <span
+                            key={file}
+                            className="inline-flex max-w-full items-center gap-1 rounded-sm bg-white px-2 py-1 text-[11px] text-foreground"
+                          >
+                            <FileCode className="h-3 w-3 shrink-0 text-brand-cyan" />
+                            <span className="truncate">{file}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div ref={chatEndRef} />
             </div>

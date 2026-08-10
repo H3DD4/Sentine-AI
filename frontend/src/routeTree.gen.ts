@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ChatRouteImport } from './routes/chat'
+import { Route as ConversationsRouteImport } from './routes/conversations'
 import { Route as KnowledgeRouteImport } from './routes/knowledge'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as ReportRouteImport } from './routes/report'
@@ -24,6 +25,11 @@ const IndexRoute = IndexRouteImport.update({
 const ChatRoute = ChatRouteImport.update({
   id: '/chat',
   path: '/chat',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConversationsRoute = ConversationsRouteImport.update({
+  id: '/conversations',
+  path: '/conversations',
   getParentRoute: () => rootRouteImport,
 } as any)
 const KnowledgeRoute = KnowledgeRouteImport.update({
@@ -50,6 +56,7 @@ const SettingsRoute = SettingsRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/chat': typeof ChatRoute
+  '/conversations': typeof ConversationsRoute
   '/knowledge': typeof KnowledgeRoute
   '/login': typeof LoginRoute
   '/report': typeof ReportRoute
@@ -58,6 +65,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/chat': typeof ChatRoute
+  '/conversations': typeof ConversationsRoute
   '/knowledge': typeof KnowledgeRoute
   '/login': typeof LoginRoute
   '/report': typeof ReportRoute
@@ -67,6 +75,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/chat': typeof ChatRoute
+  '/conversations': typeof ConversationsRoute
   '/knowledge': typeof KnowledgeRoute
   '/login': typeof LoginRoute
   '/report': typeof ReportRoute
@@ -74,13 +83,28 @@ export interface FileRoutesById {
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/chat' | '/knowledge' | '/login' | '/report' | '/settings'
+  fullPaths:
+    | '/'
+    | '/chat'
+    | '/conversations'
+    | '/knowledge'
+    | '/login'
+    | '/report'
+    | '/settings'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/chat' | '/knowledge' | '/login' | '/report' | '/settings'
+  to:
+    | '/'
+    | '/chat'
+    | '/conversations'
+    | '/knowledge'
+    | '/login'
+    | '/report'
+    | '/settings'
   id:
     | '__root__'
     | '/'
     | '/chat'
+    | '/conversations'
     | '/knowledge'
     | '/login'
     | '/report'
@@ -90,6 +114,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ChatRoute: typeof ChatRoute
+  ConversationsRoute: typeof ConversationsRoute
   KnowledgeRoute: typeof KnowledgeRoute
   LoginRoute: typeof LoginRoute
   ReportRoute: typeof ReportRoute
@@ -110,6 +135,13 @@ declare module '@tanstack/react-router' {
       path: '/chat'
       fullPath: '/chat'
       preLoaderRoute: typeof ChatRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/conversations': {
+      id: '/conversations'
+      path: '/conversations'
+      fullPath: '/conversations'
+      preLoaderRoute: typeof ConversationsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/knowledge': {
@@ -146,6 +178,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ChatRoute: ChatRoute,
+  ConversationsRoute: ConversationsRoute,
   KnowledgeRoute: KnowledgeRoute,
   LoginRoute: LoginRoute,
   ReportRoute: ReportRoute,

@@ -9,6 +9,7 @@ import {
   Menu,
   LogOut,
   User,
+  History,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { Logo } from "@/components/brand/Logo";
@@ -20,6 +21,7 @@ import { authLogout, getStoredUser } from "@/lib/auth";
 const nav = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/chat", label: "Analysis", icon: MessagesSquare },
+  { to: "/conversations", label: "History", icon: History },
   { to: "/report", label: "Report Builder", icon: FileText },
   { to: "/knowledge", label: "Knowledge Base", icon: BookOpen },
   { to: "/settings", label: "Settings", icon: Settings },

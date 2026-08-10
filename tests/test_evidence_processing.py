@@ -9,6 +9,7 @@ from fastapi import HTTPException, UploadFile
 
 from app.services.query_planner import _evenly_select
 from app.services.retrieval import _exact_id_query_sync
+from app.services.evidence import parse_evidence
 from app.services.upload_processing import cleanup_staged_evidence, stage_evidence_uploads
 from app.services.validation import _bounded_items, _representative_text
 
@@ -61,6 +62,18 @@ class EvidenceProcessingTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.status_code, 413)
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_image_is_retained_for_manual_review_when_vision_fails(self):
+        with patch(
+            "app.services.evidence.describe_image",
+            side_effect=RuntimeError("vision provider unavailable"),
+        ):
+            parsed = asyncio.run(parse_evidence("finding.jpeg", b"jpeg bytes"))
+
+        self.assertEqual(parsed["file_type"], "image")
+        self.assertTrue(parsed["needs_manual_review"])
+        self.assertIn("manual review", parsed["image_description"])
+        self.assertIn("image was retained", parsed["processing_notices"][0])
 
     def test_exact_id_lookup_keeps_hybrid_payload_filter(self):
         qdrant = Mock()

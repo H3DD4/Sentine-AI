@@ -15,6 +15,18 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class AnalysisConversation(Base):
+    __tablename__ = "analysis_conversations"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    title = Column(String, nullable=False, default="Untitled analysis")
+    messages = Column(JSON, default=list, nullable=False)
+    validation_snapshot = Column(JSON, nullable=True)
+    readiness_snapshot = Column(JSON, nullable=True)
+    finding_id = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False, index=True)
+
 class VerdictEnum(str, enum.Enum):
     confirmed = "confirmed"
     likely = "likely"

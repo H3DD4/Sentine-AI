@@ -79,8 +79,6 @@ log = logging.getLogger(__name__)
 PREFETCH_LIMIT = 40
 #: Candidates kept per source after in-collection RRF.
 PER_SOURCE_LIMIT = 15
-#: Documents handed to the cross-encoder.
-RERANK_CANDIDATES = 40
 #: Documents returned to the caller.
 FINAL_TOP_K = 8
 
@@ -475,6 +473,7 @@ async def federated_search(
     payload_filter: Optional[dict] = None,
     top_k: int = FINAL_TOP_K,
     rerank: bool = True,
+    health_map: Optional[dict] = None,
 ) -> SearchOutcome:
     """
     Run the full multi-source retrieval pipeline for one query.
@@ -491,7 +490,8 @@ async def federated_search(
     if not selected:
         return SearchOutcome(query=query)
 
-    health_map = await get_health(session, qdrant)
+    if health_map is None:
+        health_map = await get_health(session, qdrant)
 
     # Embed once and reuse across every source — the dominant CPU cost.
     notes: list[str] = []
@@ -551,7 +551,19 @@ async def federated_search(
     fused = _weighted_rrf(per_source)
 
     if rerank and settings.RERANK_ENABLED and fused:
-        fused = await asyncio.to_thread(_rerank_sync, query, fused[:RERANK_CANDIDATES])
+        candidates = fused[: settings.RERANK_CANDIDATES]
+        try:
+            async with asyncio.timeout(settings.RERANK_TIMEOUT_SECONDS):
+                reranked = await asyncio.to_thread(_rerank_sync, query, candidates)
+            # Reranking only scores the bounded candidate window. Preserve the
+            # rest of the fused list behind it so top_k remains recall-safe.
+            fused = reranked + [hit for hit in fused if hit not in candidates]
+        except TimeoutError:
+            notes.append(
+                f"cross-encoder reranking exceeded {settings.RERANK_TIMEOUT_SECONDS:.0f}s; "
+                "returned hybrid RRF order"
+            )
+            log.warning("Reranking timed out for query; returning RRF order")
         # Checked *after* the attempt, since the loader resolves lazily on
         # first use — asking before this point would always report "fine".
         note = reranker_status()
@@ -590,6 +602,7 @@ async def multimodal_search(
     sources: Optional[Sequence[str]] = None,
     cvss_min: float = 0.0,
     top_k: int = FINAL_TOP_K,
+    rerank: bool = True,
 ) -> SearchOutcome:
     """
     Retrieve over every modality of a finding, not just its prose description.
@@ -606,6 +619,9 @@ async def multimodal_search(
     if not planned:
         return SearchOutcome(query=description or "")
 
+    qdrant = get_qdrant()
+    health_map = await get_health(session, qdrant)
+
     if len(planned) == 1:
         # Single modality: no cross-query fusion to do, and going through the
         # fuser would needlessly rewrite scores that are already comparable.
@@ -613,8 +629,10 @@ async def multimodal_search(
             planned[0].text,
             session,
             sources=sources,
-            cvss_min=cvss_min,
-            top_k=top_k,
+                cvss_min=cvss_min,
+                top_k=top_k,
+            rerank=rerank,
+            health_map=health_map,
         )
 
     results = await asyncio.gather(
@@ -628,7 +646,11 @@ async def multimodal_search(
                 # a document ranked mid-list by several modalities can still
                 # win on agreement — the main reason to fuse rather than to
                 # concatenate top-k lists.
-                top_k=max(top_k * 2, RERANK_CANDIDATES // 2),
+                top_k=max(top_k * 2, settings.RERANK_CANDIDATES),
+                # Rerank once after all modalities are fused below. Running a
+                # cross-encoder inside every query arm multiplies CPU latency.
+                rerank=False,
+                health_map=health_map,
             )
             for q in planned
         ],
@@ -647,6 +669,24 @@ async def multimodal_search(
 
     outcome = fuse_outcomes(pairs, top_k=top_k)
     outcome.query = description or ""
+    if rerank and settings.RERANK_ENABLED and outcome.hits:
+        candidates = outcome.hits[: settings.RERANK_CANDIDATES]
+        try:
+            async with asyncio.timeout(settings.RERANK_TIMEOUT_SECONDS):
+                reranked = await asyncio.to_thread(
+                    _rerank_sync,
+                    description or planned[0].text,
+                    candidates,
+                )
+            outcome.hits = (reranked + [hit for hit in outcome.hits if hit not in candidates])[:top_k]
+            for rank, hit in enumerate(outcome.hits):
+                hit.rank = rank
+        except TimeoutError:
+            outcome.notes.append(
+                f"cross-encoder reranking exceeded {settings.RERANK_TIMEOUT_SECONDS:.0f}s; "
+                "returned hybrid RRF order"
+            )
+            log.warning("Multimodal reranking timed out; returning fused RRF order")
     log.info(
         "Multimodal search: %d queries (%s) → %d hits from %s",
         len(pairs),

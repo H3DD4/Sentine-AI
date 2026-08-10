@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 from docx import Document
 
+from app.models import Evidence, Finding, VerdictEnum
 from app.schemas import ChatMessage, ReportDraft
 from app.services.report import generate_report_docx
 from app.routers.report import _missing_report_fields
@@ -20,6 +21,8 @@ from app.services.report_readiness import (
     _normalize_extraction,
     assess_conversation,
     draft_to_finding,
+    finding_evidence_context,
+    finding_report_draft,
     score_report_draft,
 )
 
@@ -137,6 +140,80 @@ class ReportReadinessTests(unittest.TestCase):
         self.assertTrue(result.eligible)
         self.assertEqual(result.status, "ready")
         self.assertEqual(result.missing, [])
+
+    def test_persisted_screenshot_evidence_is_report_substance(self):
+        finding = Finding(
+            title="Laravel debug mode disclosure",
+            description="The reset endpoint returns a production debug page.",
+            verdict=VerdictEnum.confirmed,
+            confidence=0.95,
+            reasoning="The screenshot exposes environment configuration and credentials.",
+            matched_cves=[],
+            matched_techniques=[],
+            recommended_next_steps=[],
+            reproduction_steps=[],
+        )
+        evidence = Evidence(
+            filename="finding.jpeg",
+            image_description=(
+                "Screenshot of https://example.test/password/reset showing APP_DEBUG=true, "
+                "a Laravel stack trace, DB_HOST, DB_USERNAME, and DB_PASSWORD."
+            ),
+        )
+
+        draft = finding_report_draft(finding, [evidence])
+        context = finding_evidence_context(finding, [evidence])
+        result = score_report_draft(draft)
+
+        self.assertIn("APP_DEBUG=true", draft.technical_evidence)
+        self.assertIn("DB_PASSWORD", context)
+        self.assertEqual(draft.verdict.value, "confirmed")
+        self.assertTrue(result.eligible)
+
+    def test_ai_extraction_cannot_erase_persisted_evidence(self):
+        finding = Finding(
+            title="Debug disclosure",
+            description="A debug page was observed.",
+            verdict=VerdictEnum.confirmed,
+            confidence=0.9,
+            matched_cves=[],
+            matched_techniques=[],
+            recommended_next_steps=[],
+            reproduction_steps=[],
+        )
+        evidence = Evidence(
+            filename="finding.jpeg",
+            image_description="The screenshot exposes APP_KEY and database credentials.",
+        )
+        baseline = finding_report_draft(finding, [evidence])
+        client = AsyncMock()
+        client.generate_validation.return_value = {
+            "title": "Debug disclosure",
+            "description": "A debug page was observed.",
+            "technical_evidence": "",
+            "reproduction_steps": [],
+            "impact": "",
+            "severity": "",
+            "cvss_score": None,
+            "cvss_vector": "",
+            "remediation": [],
+            "matched_cves": [],
+            "matched_techniques": [],
+            "verdict": None,
+            "confidence": None,
+        }
+
+        with patch("app.services.report_readiness.AsyncLLMClient", return_value=client):
+            result = asyncio.run(
+                assess_conversation(
+                    [ChatMessage(role="user", content="Review the uploaded screenshot.")],
+                    finding_evidence_context(finding, [evidence]),
+                    baseline,
+                )
+            )
+
+        self.assertIn("APP_KEY", result.draft.technical_evidence)
+        self.assertEqual(result.draft.verdict.value, "confirmed")
 
     def test_confirmed_struts_rce_evidence_is_reportable(self):
         result = score_report_draft(

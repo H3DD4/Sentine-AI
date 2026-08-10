@@ -4,10 +4,13 @@ Handles text extraction from PDFs, images (via vision model), and plain text.
 """
 
 import io
+import logging
 from pathlib import Path
 import fitz  # PyMuPDF
 from PIL import Image
 from app.services.validation import describe_image
+
+log = logging.getLogger(__name__)
 
 SUPPORTED_IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 SUPPORTED_TEXT_TYPES = {".txt", ".log", ".csv", ".xml", ".json", ".yaml", ".yml", ".md"}
@@ -128,7 +131,22 @@ async def parse_evidence(filename: str, file_bytes: bytes) -> dict:
             ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
         }
         media_type = mime_map.get(ext, "image/png")
-        description = await describe_image(file_bytes, media_type)
+        try:
+            description = await describe_image(file_bytes, media_type)
+        except Exception as exc:
+            log.warning("Vision extraction failed for %s: %s", safe_name, exc)
+            return {
+                "file_type": "image",
+                "extracted_text": None,
+                "image_description": "(Automatic image analysis unavailable; manual review required)",
+                "needs_manual_review": True,
+                "safe_filename": safe_name,
+                "extracted_chars": 0,
+                "selected_chars": 0,
+                "processing_notices": [
+                    "The image was retained but automatic analysis failed; manual review is required."
+                ],
+            }
         return {
             "file_type": "image",
             "extracted_text": None,

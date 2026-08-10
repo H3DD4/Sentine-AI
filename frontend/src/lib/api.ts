@@ -17,11 +17,7 @@ import { apiFetch } from "./auth";
 
 // Vite runs separately in development; deployed builds use the current origin.
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "");
-const API_BASE =
-  configuredApiBase ??
-  (typeof window !== "undefined" && window.location.port !== "8000" && window.location.port !== ""
-    ? "http://localhost:8000"
-    : "");
+const API_BASE = configuredApiBase ?? "http://localhost:8000";
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -368,6 +364,17 @@ export interface AppSettings {
 
 export type Settings = AppSettings;
 
+export interface AnalysisConversation {
+  id: string;
+  title: string;
+  messages: Array<Record<string, unknown>>;
+  validation_snapshot: ValidationResponse | null;
+  readiness_snapshot: ReportReadiness | null;
+  finding_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────
 
 export class ApiError extends Error {
@@ -469,7 +476,7 @@ export function streamChatMessage(
       controller.abort();
     }, delay);
   };
-  armTimeout(90_000);
+  armTimeout(180_000);
 
   const finish = (callback: () => void) => {
     if (settled) return;
@@ -499,7 +506,7 @@ export function streamChatMessage(
         const { done, value } = await reader.read();
         if (done) break;
         // Once the server is responding, only abort a genuinely stalled stream.
-        armTimeout(60_000);
+        armTimeout(120_000);
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n\n");
@@ -555,6 +562,7 @@ export async function validateFinding(
   title: string,
   description: string,
   files?: File[],
+  signal?: AbortSignal,
 ): Promise<ValidationResponse> {
   const formData = new FormData();
   formData.append("title", title);
@@ -564,7 +572,7 @@ export async function validateFinding(
       formData.append("files", file);
     }
   }
-  return request<ValidationResponse>("POST", "/validate", formData);
+  return request<ValidationResponse>("POST", "/validate", formData, signal);
 }
 
 // ─── Findings ─────────────────────────────────────────────────────────
@@ -719,8 +727,14 @@ export async function pushToGhostwriter(
 
 // ─── Reports ──────────────────────────────────────────────────────────
 
-export async function assessReportReadiness(messages: ChatMessage[]): Promise<ReportReadiness> {
-  return request<ReportReadiness>("POST", "/reports/readiness", { messages });
+export async function assessReportReadiness(
+  messages: ChatMessage[],
+  findingId?: string | null,
+): Promise<ReportReadiness> {
+  return request<ReportReadiness>("POST", "/reports/readiness", {
+    messages,
+    finding_id: findingId,
+  });
 }
 
 export async function generateReport(requestData: ReportRequest): Promise<Blob> {
@@ -783,4 +797,31 @@ export interface AuditLog {
 export async function listAuditLogs(eventType?: string): Promise<AuditLog[]> {
   const params = eventType ? `?event_type=${eventType}` : "";
   return request<AuditLog[]>("GET", `/audit${params}`);
+}
+
+export async function listConversations(): Promise<AnalysisConversation[]> {
+  return request<AnalysisConversation[]>("GET", "/conversations");
+}
+
+export async function getConversation(id: string): Promise<AnalysisConversation> {
+  return request<AnalysisConversation>("GET", `/conversations/${id}`);
+}
+
+type ConversationState = Partial<
+  Omit<AnalysisConversation, "id" | "created_at" | "updated_at">
+>;
+
+export async function createConversation(state: ConversationState): Promise<AnalysisConversation> {
+  return request<AnalysisConversation>("POST", "/conversations", state);
+}
+
+export async function updateConversation(
+  id: string,
+  state: ConversationState,
+): Promise<AnalysisConversation> {
+  return request<AnalysisConversation>("PATCH", `/conversations/${id}`, state);
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  return request<void>("DELETE", `/conversations/${id}`);
 }
