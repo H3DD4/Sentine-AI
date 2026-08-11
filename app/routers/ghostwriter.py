@@ -1,3 +1,4 @@
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
@@ -9,7 +10,10 @@ router = APIRouter(prefix="/ghostwriter", tags=["ghostwriter"])
 
 @router.get("/projects")
 async def list_projects():
-    return await get_projects()
+    try:
+        return await get_projects()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, f"Ghostwriter connection failed: {exc}") from exc
 
 @router.post("/push")
 async def push_to_ghostwriter(
@@ -22,7 +26,10 @@ async def push_to_ghostwriter(
     if finding.verdict in ("false_positive", "insufficient") and not finding.analyst_confirmed:
         raise HTTPException(400, "Analyst must confirm this verdict before pushing to Ghostwriter")
 
-    gw_id = await push_finding(finding, req.project_id)
+    try:
+        gw_id = await push_finding(finding, req.project_id)
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, f"Ghostwriter push failed: {exc}") from exc
     finding.ghostwriter_finding_id = gw_id
     session.add(AuditLog(
         event_type="ghostwriter_push",

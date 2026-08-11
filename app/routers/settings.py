@@ -79,8 +79,20 @@ def get_provider_base_url(key: str, default: str) -> str:
 @router.get("", response_model=SettingsOut)
 async def get_settings():
     active_provider = _get_active_provider()
+    active_chat_model = _get_provider_model(
+        f"{active_provider.value}_chat_model",
+        getattr(app_settings, f"{active_provider.value.upper()}_CHAT_MODEL"),
+    )
+    fallback_models = getattr(
+        app_settings,
+        f"{active_provider.value.upper()}_CHAT_FALLBACK_MODELS",
+        [],
+    )
     return SettingsOut(
         llm_provider=active_provider.value,
+        available_chat_models=list(
+            dict.fromkeys([active_chat_model, *fallback_models])
+        ),
         # Provider key status
         anthropic_api_key_set=bool(app_settings.ANTHROPIC_API_KEY),
         openai_api_key_set=bool(app_settings.OPENAI_API_KEY),
@@ -102,6 +114,9 @@ async def get_settings():
         openrouter_chat_model=_get_provider_model("openrouter_chat_model", app_settings.OPENROUTER_CHAT_MODEL),
         openrouter_validation_model=_get_provider_model("openrouter_validation_model", app_settings.OPENROUTER_VALIDATION_MODEL),
         openrouter_vision_model=_get_provider_model("openrouter_vision_model", app_settings.OPENROUTER_VISION_MODEL),
+        openrouter_chat_fallback_models=app_settings.OPENROUTER_CHAT_FALLBACK_MODELS,
+        openrouter_validation_fallback_models=app_settings.OPENROUTER_VALIDATION_FALLBACK_MODELS,
+        openrouter_vision_fallback_models=app_settings.OPENROUTER_VISION_FALLBACK_MODELS,
         ollama_base_url=_runtime_settings.get("ollama_base_url") or app_settings.OLLAMA_BASE_URL,
         ollama_chat_model=_get_provider_model("ollama_chat_model", app_settings.OLLAMA_CHAT_MODEL),
         ollama_validation_model=_get_provider_model("ollama_validation_model", app_settings.OLLAMA_VALIDATION_MODEL),

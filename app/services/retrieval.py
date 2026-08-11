@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 import time
 from typing import Any, Optional, Sequence
 
@@ -113,6 +114,7 @@ def get_qdrant() -> QdrantClient:
 
 _reranker = None
 _reranker_failed = False
+_reranker_lock = threading.RLock()
 #: Why the reranker is not in use, in analyst-facing words. Empty when it is
 #: working. Surfaced through SearchOutcome so a silently-degraded ranking is
 #: never presented as a fully-ranked one.
@@ -135,39 +137,44 @@ def load_reranker_sync() -> None:
     "this query never came back".
     """
     global _reranker, _reranker_failed, _reranker_note
-    if _reranker is not None or _reranker_failed:
-        return
-    try:
-        from sentence_transformers import CrossEncoder
+    with _reranker_lock:
+        if _reranker is not None or _reranker_failed:
+            return
+        try:
+            from sentence_transformers import CrossEncoder
 
-        name = getattr(settings, "RERANKER_MODEL", "BAAI/bge-reranker-base")
-        offline = not getattr(settings, "ALLOW_MODEL_DOWNLOADS", False)
-        log.info("Loading reranker: %s (offline=%s) …", name, offline)
-        _reranker = CrossEncoder(
-            name, model_kwargs={"local_files_only": offline} if offline else {}
-        )
-        _reranker_note = ""
-        log.info("Reranker ready.")
-    except Exception as exc:
-        _reranker_failed = True
-        _reranker_note = (
-            "results are ranked by hybrid fusion score; the cross-encoder "
-            "reranker is not available on this host"
-        )
-        log.warning("Reranker unavailable, falling back to RRF order: %s", exc)
+            name = getattr(settings, "RERANKER_MODEL", "BAAI/bge-reranker-base")
+            offline = not getattr(settings, "ALLOW_MODEL_DOWNLOADS", False)
+            log.info("Loading reranker: %s (offline=%s) …", name, offline)
+            _reranker = CrossEncoder(
+                name, model_kwargs={"local_files_only": offline} if offline else {}
+            )
+            _reranker_note = ""
+            log.info("Reranker ready.")
+        except Exception as exc:
+            _reranker_failed = True
+            _reranker_note = (
+                "results are ranked by hybrid fusion score; the cross-encoder "
+                "reranker is not available on this host"
+            )
+            log.warning("Reranker unavailable, falling back to RRF order: %s", exc)
 
 
 def _rerank_sync(query: str, hits: list[RetrievalHit]) -> list[RetrievalHit]:
-    load_reranker_sync()
-    if _reranker is None or not hits:
-        return hits
+    # asyncio timeouts cannot cancel a worker thread. Serializing this section
+    # prevents a timed-out inference from overlapping the next request and also
+    # prevents concurrent first requests from loading duplicate model copies.
+    with _reranker_lock:
+        load_reranker_sync()
+        if _reranker is None or not hits:
+            return hits
 
-    pairs = [(query, f"{h.title}\n{h.text}"[:2000]) for h in hits]
-    try:
-        scores = _reranker.predict(pairs)
-    except Exception as exc:
-        log.warning("Rerank failed, keeping RRF order: %s", exc)
-        return hits
+        pairs = [(query, f"{h.title}\n{h.text}"[:2000]) for h in hits]
+        try:
+            scores = _reranker.predict(pairs)
+        except Exception as exc:
+            log.warning("Rerank failed, keeping RRF order: %s", exc)
+            return hits
 
     for h, s in zip(hits, scores):
         h.score = float(s)
@@ -427,38 +434,71 @@ def _weighted_rrf(
     per_source: list[tuple[KBSource, list[RetrievalHit]]]
 ) -> list[RetrievalHit]:
     """
-    Fuse per-source rankings with weighted Reciprocal Rank Fusion.
+    Interleave independent per-source rankings for the reranker candidate set.
 
-        score(d) = Σ_sources  weight_s / (RRF_K + rank_s(d))
+    A document exists in exactly one source, so cross-source RRF has no ranks to
+    fuse: multiplying each source-local rank by its source weight makes the
+    weight dominate relevance. With RRF_K=60, the old 1.15 OWASP weight put its
+    first 10+ documents ahead of every rank-0 MITRE/NVD match. Rank is therefore
+    the primary key, while editorial trust breaks ties at the same rank.
 
-    Rank-based, so a source whose scores happen to run high cannot dominate;
-    weights express editorial trust (firm findings over public feeds) rather
-    than score calibration.
+    Exact identifiers are globally pinned before semantic matches. This keeps
+    a named CVE or ATT&CK technique deterministic without letting one source
+    monopolize the fallback list when the cross-encoder is unavailable.
     """
-    scored: list[tuple[float, RetrievalHit]] = []
-    for source, hits in per_source:
+    scored: list[tuple[bool, int, float, int, RetrievalHit]] = []
+    for source_index, (source, hits) in enumerate(per_source):
         for rank, hit in enumerate(hits):
-            # Exact-ID matches enter fusion at rank 0 so a named document
-            # cannot be pushed out by semantically similar neighbours.
-            effective_rank = 0 if hit.payload.get("matched_by") == "exact_id" else rank
-            scored.append((source.weight / (RRF_K + effective_rank + 1), hit))
+            exact = hit.payload.get("matched_by") == "exact_id"
+            scored.append((not exact, rank, -source.weight, source_index, hit))
 
-    merged: dict[tuple[str, str], tuple[float, RetrievalHit]] = {}
-    for s, hit in scored:
+    merged: dict[tuple[str, str], tuple[bool, int, float, int, RetrievalHit]] = {}
+    for item in scored:
+        exact_sort, rank, neg_weight, source_index, hit = item
         key = (hit.source_key, hit.doc_id)
         prev = merged.get(key)
-        if prev is None:
-            merged[key] = (s, hit)
-        else:
-            merged[key] = (prev[0] + s, prev[1])
+        if prev is None or item[:4] < prev[:4]:
+            merged[key] = item
 
-    ordered = sorted(merged.values(), key=lambda t: t[0], reverse=True)
+    ordered = sorted(merged.values(), key=lambda item: item[:4])
     out = []
-    for rank, (s, hit) in enumerate(ordered):
-        hit.score = s
-        hit.rank = rank
+    for final_rank, (not_exact, source_rank, _neg_weight, _source_index, hit) in enumerate(ordered):
+        hit.score = 1.0 if not not_exact else 1.0 / (RRF_K + source_rank + 1)
+        hit.rank = final_rank
         out.append(hit)
     return out
+
+
+def _prioritize_ghostwriter(hits: list[RetrievalHit]) -> list[RetrievalHit]:
+    """Keep one relevant firm finding in context without hiding other sources."""
+    ghostwriter = [hit for hit in hits if hit.source_key == "ghostwriter"]
+    if not ghostwriter:
+        return hits
+
+    exact = [hit for hit in hits if hit.payload.get("matched_by") == "exact_id"]
+    primary = ghostwriter[0]
+    if primary in exact:
+        return hits
+    rest = [hit for hit in hits if hit is not primary and hit not in exact]
+    return exact + [primary] + rest
+
+
+def _preserve_source_coverage(
+    ranked: list[RetrievalHit], original: list[RetrievalHit]
+) -> list[RetrievalHit]:
+    """Restore one best candidate for any searched source removed by reranking."""
+    representatives: list[RetrievalHit] = []
+    candidates = [*ranked, *original]
+    source_order = list(dict.fromkeys(hit.source_key for hit in original))
+    for source_key in source_order:
+        hit = next((item for item in candidates if item.source_key == source_key), None)
+        if hit is not None:
+            representatives.append(hit)
+
+    restored = list(representatives)
+    restored.extend(hit for hit in ranked if hit not in restored)
+    restored.extend(hit for hit in original if hit not in restored)
+    return restored
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -549,6 +589,7 @@ async def federated_search(
             per_source.append((src, hits))
 
     fused = _weighted_rrf(per_source)
+    pre_rerank = list(fused)
 
     if rerank and settings.RERANK_ENABLED and fused:
         candidates = fused[: settings.RERANK_CANDIDATES]
@@ -569,6 +610,13 @@ async def federated_search(
         note = reranker_status()
         if note:
             notes.append(note)
+
+    fused = _preserve_source_coverage(fused, pre_rerank)
+
+    # Ghostwriter is the firm's methodological corpus. Preserve its strongest
+    # relevant result in the bounded answer context, while keeping every other
+    # source and any exact identifier match visible as well.
+    fused = _prioritize_ghostwriter(fused)
 
     final = fused[:top_k]
 

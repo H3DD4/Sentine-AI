@@ -1,14 +1,22 @@
 import asyncio
 import io
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from docx import Document
 
-from app.models import Evidence, Finding, VerdictEnum
-from app.schemas import ChatMessage, ReportDraft
+from app.models import AuditLog, Evidence, Finding, GeneratedReport, User, VerdictEnum
+from app.schemas import ChatMessage, ReportDraft, ReportRequest
 from app.services.report import generate_report_docx
-from app.routers.report import _missing_report_fields
+from app.routers.report import (
+    _force_export_audit,
+    _missing_report_fields,
+    _validate_export_gate,
+    generate_report,
+)
 from app.kb.base import SearchOutcome
 from app.routers.chat import (
     _bounded_provider_messages,
@@ -358,6 +366,108 @@ class ReportReadinessTests(unittest.TestCase):
         self.assertIn("impact", gaps)
         self.assertIn("severity", gaps)
         self.assertIn("analyst verdict", gaps)
+
+    def test_score_at_least_five_can_be_force_exported(self):
+        finding = draft_to_finding(ReportDraft(
+            title="Command injection",
+            description="Commands execute through host.",
+            affected_scope="POST /ping",
+            technical_evidence="The response returned uid=33(www-data).",
+            reproduction_steps=["Submit host=127.0.0.1;id."],
+        ))
+        request = ReportRequest(
+            finding_ids=[],
+            engagement_title="External test",
+            client_name="Northwind",
+            force_export=True,
+            acknowledge_incomplete=True,
+        )
+
+        overrides = _validate_export_gate(request, [finding])
+
+        self.assertEqual(len(overrides), 1)
+        self.assertGreaterEqual(overrides[0][1], 5)
+        self.assertIn("impact", overrides[0][2])
+
+    def test_score_below_five_remains_blocked(self):
+        finding = draft_to_finding(ReportDraft(
+            title="Command injection",
+            description="Commands may execute through host.",
+            technical_evidence="A shell metacharacter changed the response.",
+        ))
+        request = ReportRequest(
+            finding_ids=[],
+            engagement_title="External test",
+            client_name="Northwind",
+            force_export=True,
+            acknowledge_incomplete=True,
+        )
+
+        with self.assertRaisesRegex(Exception, "below 5.0/10"):
+            _validate_export_gate(request, [finding])
+
+    def test_force_export_audit_captures_override_details(self):
+        audit = _force_export_audit(
+            finding_id="finding-1",
+            finding_title="Command injection",
+            user_id="user-1",
+            score=6.5,
+            missing=["impact", "severity", "analyst verdict"],
+            report_id="report-1",
+            filename="report.docx",
+        )
+
+        self.assertEqual(audit.event_type, "report_force_export")
+        self.assertEqual(audit.finding_id, "finding-1")
+        self.assertEqual(audit.user_id, "user-1")
+        self.assertEqual(audit.payload_summary["confidence_score"], 6.5)
+        self.assertEqual(
+            audit.payload_summary["incomplete_sections"],
+            ["impact", "severity", "analyst verdict"],
+        )
+
+    def test_generate_report_commits_force_export_audit(self):
+        request = ReportRequest(
+            finding_ids=[],
+            engagement_title="External test",
+            client_name="Northwind",
+            draft=ReportDraft(
+                title="Command injection",
+                description="Commands execute through host.",
+                affected_scope="POST /ping",
+                technical_evidence="The response returned uid=33(www-data).",
+                reproduction_steps=["Submit host=127.0.0.1;id."],
+            ),
+            force_export=True,
+            acknowledge_incomplete=True,
+        )
+        session = SimpleNamespace(
+            execute=AsyncMock(return_value=MagicMock(scalar_one_or_none=lambda: None)),
+            add=MagicMock(),
+            commit=AsyncMock(),
+        )
+        user = User(id="user-1", email="analyst@example.com", is_active=True)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "app.routers.report.settings.REPORT_DIR", directory
+        ), patch(
+            "app.routers.report.generate_report_docx",
+            new=AsyncMock(return_value=b"docx-content"),
+        ):
+            response = asyncio.run(generate_report(request, session, user))
+
+        added = [call.args[0] for call in session.add.call_args_list]
+        audits = [item for item in added if isinstance(item, AuditLog)]
+        report = next(item for item in added if isinstance(item, GeneratedReport))
+        override = next(item for item in audits if item.event_type == "report_force_export")
+        generated = next(item for item in audits if item.event_type == "report_generated")
+
+        self.assertEqual(response.body, b"docx-content")
+        self.assertEqual(override.user_id, "user-1")
+        self.assertEqual(override.result_summary["report_id"], report.id)
+        self.assertTrue(generated.payload_summary["forced_export"])
+        session.commit.assert_awaited_once()
+        self.assertFalse(Path(report.storage_path).exists())
 
     def test_uploaded_template_is_used_and_placeholders_are_replaced(self):
         template = Document()

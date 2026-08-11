@@ -23,6 +23,7 @@ const API_BASE = configuredApiBase ?? "http://localhost:8000";
 
 export type Verdict = "confirmed" | "likely" | "insufficient" | "false_positive";
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
+export type BusinessPriority = "critical" | "high" | "moderate" | "low" | "pending_context";
 export type EngagementStatus = "active" | "reporting" | "scoping";
 
 export interface Evidence {
@@ -47,6 +48,7 @@ export interface Finding {
   technical_evidence: string | null;
   reproduction_steps: string[];
   impact: string | null;
+  impact_assessment: ImpactAssessment | null;
   severity: string | null;
   cvss_score: number | null;
   cvss_vector: string | null;
@@ -196,6 +198,13 @@ export interface Provenance {
   citations: Citation[];
 }
 
+export interface GenerationInfo {
+  provider: string;
+  model: string;
+  primary_model: string;
+  fallback_used: boolean;
+}
+
 export interface ProcessingFile {
   filename: string;
   file_type: string;
@@ -214,6 +223,7 @@ export interface ProcessingManifest {
 
 export interface ChatResponse extends Partial<Provenance> {
   response: string;
+  generation?: GenerationInfo | null;
   processing?: ProcessingManifest;
 }
 
@@ -223,8 +233,70 @@ export interface ValidationResult {
   reasoning: string;
   matched_cves: string[];
   matched_techniques: string[];
+  mappings: SecurityMapping[];
   missing_evidence: string[];
   recommended_next_steps: string[];
+  impact_assessment: ImpactAssessment;
+}
+
+export interface ImpactClaim {
+  level: "observed" | "logically_demonstrated" | "conditional";
+  statement: string;
+  evidence_basis: string;
+  conditions: string[];
+}
+
+export interface ClarificationQuestion {
+  question: string;
+  why_it_matters: string;
+  answer_options: string[];
+}
+
+export interface SecurityMapping {
+  mapping_type: "cve" | "cwe" | "owasp" | "attack";
+  identifier: string;
+  name: string;
+  applicability: "direct" | "supporting" | "conditional" | "rejected" | "unsupported";
+  rationale: string;
+  evidence_basis: string;
+  source: string;
+  source_doc_id: string;
+}
+
+export interface CVSSScenario {
+  label: string;
+  vector: string;
+  score: number;
+  severity: string;
+  assumptions: string[];
+  rationale: string;
+}
+
+export interface ImpactAssessment {
+  demonstrated_capability: string;
+  technical_impact: string;
+  affected_assets: string[];
+  affected_data: string[];
+  affected_business_processes: string[];
+  business_impact: string;
+  business_priority: BusinessPriority;
+  priority_rationale: string;
+  cvss: {
+    status: "exact" | "range" | "pending_evidence" | "not_applicable";
+    version: "4.0" | "3.1" | "";
+    vector: string;
+    score: number | null;
+    severity: string;
+    rationale: string;
+    lower_bound: CVSSScenario | null;
+    upper_bound: CVSSScenario | null;
+    unresolved_metrics: string[];
+  };
+  claims: ImpactClaim[];
+  excluded_claims: string[];
+  assumptions: string[];
+  clarification_questions: ClarificationQuestion[];
+  context_complete: boolean;
 }
 
 export type ValidationResponse = ValidationResult &
@@ -291,8 +363,11 @@ export interface ReportRequest {
   engagement_title: string;
   client_name: string;
   draft?: ReportDraft;
+  draft_finding_id?: string;
   template_id?: string;
   sections: ReportSection[];
+  force_export?: boolean;
+  acknowledge_incomplete?: boolean;
 }
 
 export type ReportSection =
@@ -324,6 +399,7 @@ export interface GeneratedReport {
 
 export interface AppSettings {
   llm_provider: string;
+  available_chat_models: string[];
   anthropic_api_key_set: boolean;
   openai_api_key_set: boolean;
   together_api_key_set: boolean;
@@ -343,6 +419,9 @@ export interface AppSettings {
   openrouter_chat_model: string;
   openrouter_validation_model: string;
   openrouter_vision_model: string;
+  openrouter_chat_fallback_models: string[];
+  openrouter_validation_fallback_models: string[];
+  openrouter_vision_fallback_models: string[];
   ollama_base_url: string;
   ollama_chat_model: string;
   ollama_validation_model: string;
@@ -462,6 +541,8 @@ export function streamChatMessage(
   findingId?: string,
   onSources?: (provenance: Provenance) => void,
   onAbort?: () => void,
+  onGeneration?: (generation: GenerationInfo) => void,
+  model?: string,
 ): () => void {
   const controller = new AbortController();
   let manuallyAborted = false;
@@ -490,7 +571,7 @@ export function streamChatMessage(
       const res = await apiFetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages, finding_id: findingId }),
+        body: JSON.stringify({ messages, finding_id: findingId, model }),
         signal: controller.signal,
       });
 
@@ -531,6 +612,9 @@ export function streamChatMessage(
           }
           if (payload.sources && onSources) {
             onSources(payload as unknown as Provenance);
+          }
+          if (payload.generation && onGeneration) {
+            onGeneration(payload.generation as GenerationInfo);
           }
           if (payload.token) onToken(String(payload.token));
         }
@@ -575,6 +659,19 @@ export async function validateFinding(
   return request<ValidationResponse>("POST", "/validate", formData, signal);
 }
 
+export async function refineFindingImpact(
+  findingId: string,
+  context: string,
+  signal?: AbortSignal,
+): Promise<ValidationResponse> {
+  return request<ValidationResponse>(
+    "POST",
+    `/validate/${findingId}/impact`,
+    { context },
+    signal,
+  );
+}
+
 // ─── Findings ─────────────────────────────────────────────────────────
 
 export async function listFindings(skip = 0, limit = 50): Promise<Finding[]> {
@@ -609,6 +706,7 @@ export async function updateFinding(
       | "technical_evidence"
       | "reproduction_steps"
       | "impact"
+      | "impact_assessment"
       | "severity"
       | "cvss_score"
       | "cvss_vector"

@@ -11,8 +11,8 @@ class VisionFallbackTests(unittest.TestCase):
         client = AsyncLLMClient(provider=LLMProvider.openrouter)
         call = AsyncMock(
             side_effect=[
-                RuntimeError("primary unavailable"),
-                RuntimeError("primary unavailable"),
+                RuntimeError("ResourceExhausted: worker unavailable"),
+                RuntimeError("ResourceExhausted: worker unavailable"),
                 "image details",
             ]
         )

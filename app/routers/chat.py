@@ -14,8 +14,9 @@ from app.db import get_session
 from app.kb.base import SearchOutcome
 from app.schemas import ChatRequest, ChatMessage, ValidationResult
 from app.services.retrieval import federated_search, multimodal_search
-from app.services.llm_client import AsyncLLMClient
-from app.services.validation import validate_finding
+from app.services.llm_client import AsyncLLMClient, configured_chat_models
+from app.services.validation import impact_narrative, validate_finding
+from app.config import settings
 from app.services.upload_processing import (
     cleanup_staged_evidence,
     move_staged_evidence,
@@ -30,6 +31,11 @@ import asyncio
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 log = logging.getLogger(__name__)
+
+
+def _validate_chat_model(model: str | None) -> None:
+    if model and model not in configured_chat_models():
+        raise HTTPException(400, "Selected model is not in the configured chat model chain")
 
 CHAT_SYSTEM = """You are RedTeam Assist, an internal AI assistant for Forvis Mazars red teamers.
 You help analysts validate penetration testing findings, correlate CVEs,
@@ -46,6 +52,22 @@ Your role is finding analysis and report preparation, not defensive consulting:
 - When more information is needed, ask only for evidence that would validate or accurately
   rate the finding. Do not suggest additional post-exploitation commands when the supplied
   evidence already establishes the claimed impact.
+- Separate what was observed, what is logically demonstrated by verified permissions or architecture,
+  what is conditional, and what is not established. CVSS is technical severity, not business risk.
+- Give one exact CVSS score only when every material metric is established by current-target evidence.
+  When unknown permissions, scope, controls, or downstream effects could change metrics, present a
+  clearly labelled scenario range: an evidence-established lower scenario and a conditional upper
+  scenario with every assumption stated. Never present the upper scenario as the finding's score.
+- Grade every CVE, CWE, OWASP, and ATT&CK mapping as direct, supporting, conditional, rejected, or
+  unsupported. A similar CVE is not a matched CVE. ATT&CK credential-use techniques are conditional
+  when credentials were obtained but not used. Cite the exact retrieved source entry for any supported
+  identifier and omit identifiers that were not returned by the authoritative source this turn.
+- Connect demonstrated capability to the target's actual asset, data, identity, business process,
+  customer, financial, regulatory, operational, or safety context only when that context is supplied.
+- If target context is incomplete, give the strongest bounded technical conclusion first. Then ask
+  one compact batch of no more than three questions, selected only because the answers could change
+  the business priority or strongest defensible impact. Combine related details, offer short answer
+  choices when useful, and never repeat a question the analyst already answered.
 
 Knowledge base context is supplied in a [KB CONTEXT] section. Each entry is labelled with the
 source it came from. Ground your response in those entries and cite specific CVE or technique IDs.
@@ -53,6 +75,11 @@ source it came from. Ground your response in those entries and cite specific CVE
 The [DATA COVERAGE] line states which knowledge sources were searched for this turn and which
 were unavailable. Honour it:
 - Do not claim a source supports you unless entries from it appear in the context.
+- Do not emit a CVE or ATT&CK identifier unless that exact identifier appears in a retrieved
+  NVD or MITRE context entry. If the authoritative source did not contribute, state that no
+  source-backed identifier mapping is available for this turn.
+- Treat Ghostwriter as historical methodology and precedent, never as proof that historical
+  impact also occurred in the current test. Observed evidence controls the verdict and impact.
 - If a source was unavailable, say so plainly when the question depended on it, rather than
   filling the gap from your own training data and presenting it as retrieved fact.
 - If no context was retrieved at all, answer from general knowledge but state clearly that the
@@ -147,9 +174,8 @@ def _build_messages_with_context(
         # The source label rides on every line: without it the model cannot
         # tell a public CVE record from a colleague's prior engagement finding,
         # and neither can the analyst reading the citation afterwards.
-        lines.append(
-            f"• [{hit.source_label}] {hit.title}{cvss}: {hit.text[:300]}"
-        )
+        limit = 1200 if hit.source_key == "ghostwriter" else 600
+        lines.append(f"• [{hit.source_label}] {hit.title}{cvss}: {hit.text[:limit]}")
 
     # The coverage line is always injected, including when nothing was found —
     # that is precisely the case where the model would otherwise answer from
@@ -239,6 +265,49 @@ def _provenance_payload(outcome: SearchOutcome) -> dict:
     }
 
 
+async def _generate_complete_response(
+    client: AsyncLLMClient,
+    messages: list[dict],
+    *,
+    system: str,
+    model: str | None = None,
+) -> str:
+    """Continue only provider-confirmed length truncations, without repetition."""
+    completed = ""
+    round_messages = list(messages)
+    for continuation in range(settings.CHAT_MAX_CONTINUATIONS + 1):
+        generation_args = dict(
+            messages=round_messages,
+            system=system,
+            max_tokens=settings.CHAT_MAX_TOKENS,
+        )
+        if model is not None:
+            generation_args["model"] = model
+        part = await client.generate(**generation_args)
+        completed += part
+        if not _was_length_limited(client.last_finish_reason):
+            return completed
+        if continuation == settings.CHAT_MAX_CONTINUATIONS:
+            break
+        round_messages = [
+            *messages,
+            {"role": "assistant", "content": completed},
+            {
+                "role": "user",
+                "content": (
+                    "Continue exactly where the response stopped. Do not repeat any heading, "
+                    "table row, sentence, or source list already written. Finish all remaining "
+                    "requested sections."
+                ),
+            },
+        ]
+    return completed
+
+
+def _was_length_limited(reason: str | None) -> bool:
+    return str(reason or "").lower() in {"length", "max_tokens", "max_output_tokens"}
+
+
 def _derive_title(text: str, limit: int = 80) -> str:
     """Fallback title when the pentester doesn't give one explicitly — no form, just talk."""
     first_line = next((line.strip() for line in text.splitlines() if line.strip()), "Untitled Finding")
@@ -256,6 +325,62 @@ def _format_validation_message(
         lines += ["", "**Matched CVEs:** " + ", ".join(result.matched_cves)]
     if result.matched_techniques:
         lines += ["**MITRE Techniques:** " + ", ".join(result.matched_techniques)]
+    impact = result.impact_assessment
+    if impact.demonstrated_capability:
+        lines += ["", "**Demonstrated capability:** " + impact.demonstrated_capability]
+    if impact.technical_impact:
+        lines += ["", "**Technical impact:** " + impact.technical_impact]
+    if impact.business_impact:
+        lines += ["", "**Business impact:** " + impact.business_impact]
+    priority = impact.business_priority.value.replace("_", " ").title()
+    lines += ["", f"**Business priority:** {priority}"]
+    if impact.priority_rationale:
+        lines.append(impact.priority_rationale)
+    if impact.cvss.status == "exact":
+        lines += [
+            "",
+            f"**Technical severity (CVSS {impact.cvss.version}):** "
+            f"{impact.cvss.score:.1f} {impact.cvss.severity.title()} — `{impact.cvss.vector}`",
+        ]
+        if impact.cvss.rationale:
+            lines.append(impact.cvss.rationale)
+    elif impact.cvss.status == "range" and impact.cvss.lower_bound and impact.cvss.upper_bound:
+        lines += [
+            "",
+            f"**Technical severity range (CVSS {impact.cvss.version}):** "
+            f"{impact.cvss.lower_bound.score:.1f}–{impact.cvss.upper_bound.score:.1f}",
+            f"- Evidence-established: `{impact.cvss.lower_bound.vector}` — {impact.cvss.lower_bound.rationale}",
+            f"- Conditional upper scenario: `{impact.cvss.upper_bound.vector}` — {impact.cvss.upper_bound.rationale}",
+        ]
+        if impact.cvss.unresolved_metrics:
+            lines += ["- Unresolved: " + "; ".join(impact.cvss.unresolved_metrics)]
+    elif impact.cvss.rationale:
+        lines += ["", "**CVSS:** Pending evidence. " + impact.cvss.rationale]
+    applicable_mappings = [
+        mapping for mapping in result.mappings
+        if mapping.applicability in {"direct", "supporting", "conditional"}
+    ]
+    rejected_mappings = [
+        mapping for mapping in result.mappings
+        if mapping.applicability in {"rejected", "unsupported"}
+    ]
+    if applicable_mappings:
+        lines += ["", "**Evidence-graded mappings:**"] + [
+            f"- {mapping.identifier}: {mapping.applicability.replace('_', ' ')} — {mapping.rationale}"
+            for mapping in applicable_mappings
+        ]
+    if rejected_mappings:
+        lines += ["", "**Rejected or unsupported mappings:**"] + [
+            f"- {mapping.identifier}: {mapping.rationale}"
+            for mapping in rejected_mappings
+        ]
+    if impact.excluded_claims:
+        lines += ["", "**Not established:**"] + [f"- {claim}" for claim in impact.excluded_claims]
+    if impact.clarification_questions:
+        lines += ["", "**To finalize business impact, answer these together:**"]
+        for index, item in enumerate(impact.clarification_questions, 1):
+            options = f" Options: {', '.join(item.answer_options)}." if item.answer_options else ""
+            lines.append(f"{index}. {item.question}{options} ({item.why_it_matters})")
     if result.missing_evidence:
         lines += ["", "**Missing evidence:**"] + [f"- {m}" for m in result.missing_evidence]
     if result.recommended_next_steps:
@@ -273,12 +398,19 @@ def _format_validation_message(
 async def _persist_finding(
     title: str, description: str, result: ValidationResult, session: AsyncSession
 ) -> Finding:
+    cvss = result.impact_assessment.cvss
+    exact_cvss = cvss.status == "exact"
     finding = Finding(
         title=title,
         description=description,
         verdict=result.verdict.value,   # NOTE: switch to result.verdict if your column is a native Enum type
         confidence=result.confidence,
         reasoning=result.reasoning,
+        impact=impact_narrative(result),
+        impact_assessment=result.impact_assessment.model_dump(mode="json"),
+        severity=cvss.severity if exact_cvss else "",
+        cvss_score=cvss.score if exact_cvss else None,
+        cvss_vector=cvss.vector if exact_cvss else "",
         matched_cves=result.matched_cves,
         matched_techniques=result.matched_techniques,
         missing_evidence=result.missing_evidence,
@@ -315,6 +447,7 @@ def _safe_filename(name: str) -> str:
 
 @router.post("")
 async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
+    _validate_chat_model(req.model)
     """Standard non-streaming chat endpoint. Also handles action="validate"/"generate_report"."""
 
     if req.action == "validate":
@@ -327,6 +460,7 @@ async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
             "finding_id": finding.id,
             "verdict": result.verdict,
             "confidence": result.confidence,
+            "impact_assessment": result.impact_assessment.model_dump(mode="json"),
             **_provenance_payload(outcome),
         }
 
@@ -381,8 +515,14 @@ async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
     messages = _build_messages_with_context(req.messages, outcome)
 
     client = AsyncLLMClient()
-    response = await client.generate(messages=messages, system=CHAT_SYSTEM, max_tokens=1200)
-    return {"response": response, **_provenance_payload(outcome)}
+    response = await _generate_complete_response(
+        client, messages, system=CHAT_SYSTEM, model=req.model
+    )
+    return {
+        "response": response,
+        "generation": client.last_generation,
+        **_provenance_payload(outcome),
+    }
 
 
 # ── Multipart endpoint (evidence uploads) ───────────────────────────────────
@@ -439,6 +579,7 @@ async def chat_with_evidence(
             "finding_id": finding.id,
             "verdict": result.verdict,
             "confidence": result.confidence,
+            "impact_assessment": result.impact_assessment.model_dump(mode="json"),
             **_provenance_payload(outcome),
             "processing": processing,
         }
@@ -463,11 +604,12 @@ async def chat_with_evidence(
 
     client = AsyncLLMClient()
     try:
-        response = await client.generate(messages=llm_messages, system=CHAT_SYSTEM, max_tokens=1200)
+        response = await _generate_complete_response(client, llm_messages, system=CHAT_SYSTEM)
     finally:
         cleanup_staged_evidence(parsed_files)
     return {
         "response": response,
+        "generation": client.last_generation,
         **_provenance_payload(outcome),
         "processing": processing,
     }
@@ -491,6 +633,7 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
     rather than reading a confident paragraph and only afterwards learning
     that the CVE feed was down.
     """
+    _validate_chat_model(req.model)
     query, prior_turns = _retrieval_inputs(req.messages)
     social_reply = _social_reply(query)
 
@@ -505,13 +648,43 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
             return
 
         client = AsyncLLMClient()
+        generation_signature = None
+        completed = ""
         try:
-            async for chunk in client.generate_stream(
-                messages=messages,
-                system=CHAT_SYSTEM,
-                max_tokens=1200,
-            ):
-                yield f"data: {json.dumps({'token': chunk})}\n\n"
+            round_messages = messages
+            for continuation in range(settings.CHAT_MAX_CONTINUATIONS + 1):
+                async for chunk in client.generate_stream(
+                    messages=round_messages,
+                    system=CHAT_SYSTEM,
+                    max_tokens=settings.CHAT_MAX_TOKENS,
+                    model=req.model,
+                ):
+                    completed += chunk
+                    current_signature = json.dumps(client.last_generation, sort_keys=True)
+                    if client.last_generation and current_signature != generation_signature:
+                        yield f"data: {json.dumps({'generation': client.last_generation})}\n\n"
+                        generation_signature = current_signature
+                    yield f"data: {json.dumps({'token': chunk})}\n\n"
+                current_signature = json.dumps(client.last_generation, sort_keys=True)
+                if client.last_generation and current_signature != generation_signature:
+                    yield f"data: {json.dumps({'generation': client.last_generation})}\n\n"
+                    generation_signature = current_signature
+                if not _was_length_limited(client.last_finish_reason):
+                    break
+                if continuation == settings.CHAT_MAX_CONTINUATIONS:
+                    break
+                round_messages = [
+                    *messages,
+                    {"role": "assistant", "content": completed},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Continue exactly where the response stopped. Do not repeat any heading, "
+                            "table row, sentence, or source list already written. Finish all remaining "
+                            "requested sections."
+                        ),
+                    },
+                ]
         except Exception as exc:
             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
         finally:

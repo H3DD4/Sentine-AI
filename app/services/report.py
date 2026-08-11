@@ -109,7 +109,7 @@ async def generate_report_docx(
         doc.add_heading(f"{i}. {finding.title}", 2)
 
         # Data table — programmatically inserted, NOT LLM generated
-        table = doc.add_table(rows=6, cols=2)
+        table = doc.add_table(rows=7, cols=2)
         table.style = "Table Grid"
         rows = table.rows
         rows[0].cells[0].text = "Verdict"
@@ -123,9 +123,33 @@ async def generate_report_docx(
         rows[3].cells[1].text = ", ".join(finding.matched_cves) if finding.matched_cves else "None"
         rows[4].cells[0].text = "CVSS Base Score"
         cvss_score = getattr(finding, "cvss_score", None)
-        rows[4].cells[1].text = f"{cvss_score:.1f}" if cvss_score is not None else "N/A"
+        impact_assessment = finding.impact_assessment or {}
+        cvss_assessment = impact_assessment.get("cvss") or {}
+        if cvss_assessment.get("status") == "range":
+            lower = cvss_assessment.get("lower_bound") or {}
+            upper = cvss_assessment.get("upper_bound") or {}
+            lower_score = lower.get("score")
+            upper_score = upper.get("score")
+            rows[4].cells[1].text = (
+                f"{lower_score:.1f}-{upper_score:.1f} (scenario range)"
+                if isinstance(lower_score, (int, float)) and isinstance(upper_score, (int, float))
+                else "Pending evidence"
+            )
+        else:
+            rows[4].cells[1].text = f"{cvss_score:.1f}" if cvss_score is not None else "N/A"
         rows[5].cells[0].text = "CVSS Vector"
-        rows[5].cells[1].text = finding.cvss_vector or "N/A"
+        if cvss_assessment.get("status") == "range":
+            lower = cvss_assessment.get("lower_bound") or {}
+            upper = cvss_assessment.get("upper_bound") or {}
+            rows[5].cells[1].text = (
+                f"Established: {lower.get('vector') or 'N/A'}\n"
+                f"Conditional: {upper.get('vector') or 'N/A'}"
+            )
+        else:
+            rows[5].cells[1].text = finding.cvss_vector or "N/A"
+        rows[6].cells[0].text = "Business Priority"
+        business_priority = impact_assessment.get("business_priority", "pending_context")
+        rows[6].cells[1].text = str(business_priority).replace("_", " ").title()
 
         doc.add_paragraph()
         doc.add_heading("Description", 3)

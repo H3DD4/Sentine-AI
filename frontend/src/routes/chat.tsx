@@ -15,17 +15,30 @@ import {
   getConversation,
   updateConversation,
   getSources,
+  getSettings,
   REPORT_HANDOFF_STORAGE_KEY,
+  refineFindingImpact,
   streamChatMessage,
   validateFinding,
 } from "@/lib/api";
 import type {
   ChatMessage,
+  GenerationInfo,
   Provenance,
   ReportReadiness,
   SourcesResponse,
   ValidationResponse,
+  AppSettings,
 } from "@/lib/api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { toast } from "sonner";
 import {
   Paperclip,
@@ -50,6 +63,7 @@ import {
   ClipboardCheck,
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -68,7 +82,83 @@ type Msg = {
    * produced under.
    */
   provenance?: Provenance;
+  generation?: GenerationInfo;
 };
+
+function modelLabel(model: string): string {
+  const name =
+    model
+      .split("/")
+      .pop()
+      ?.replace(/:free$/, "") ?? model;
+  return name
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function impactOf(result: ValidationResponse) {
+  const fallback = {
+    demonstrated_capability: "",
+    technical_impact: "",
+    affected_assets: [],
+    affected_data: [],
+    affected_business_processes: [],
+    business_impact: "",
+    business_priority: "pending_context" as const,
+    priority_rationale: "Business context has not been assessed for this saved validation.",
+    cvss: {
+      status: "pending_evidence" as const,
+      version: "" as const,
+      vector: "",
+      score: null,
+      severity: "",
+      rationale: "",
+      lower_bound: null,
+      upper_bound: null,
+      unresolved_metrics: [],
+    },
+    claims: [],
+    excluded_claims: [],
+    assumptions: [],
+    clarification_questions: [],
+    context_complete: false,
+  };
+  const current = result.impact_assessment;
+  return current
+    ? { ...fallback, ...current, cvss: { ...fallback.cvss, ...current.cvss } }
+    : fallback;
+}
+
+function validationSummary(result: ValidationResponse): string {
+  const impact = impactOf(result);
+  const questions = impact.clarification_questions
+    .map((item, index) => {
+      const options = item.answer_options.length ? ` Options: ${item.answer_options.join(", ")}.` : "";
+      return `${index + 1}. ${item.question}${options}`;
+    })
+    .join("\n");
+  return (
+    `**Validation Complete**\n\n` +
+    `**Verdict:** ${result.verdict}  **Confidence:** ${Math.round(result.confidence * 100)}%\n\n` +
+    `**Reasoning:** ${result.reasoning}\n\n` +
+    `**Demonstrated Capability:** ${impact.demonstrated_capability || "Not established"}\n\n` +
+    `**Technical Impact:** ${impact.technical_impact || "Not established"}\n\n` +
+    `**Business Impact:** ${impact.business_impact || "Pending target context"}\n\n` +
+    `**Business Priority:** ${impact.business_priority.replace("_", " ")}\n\n` +
+    (impact.cvss.status === "exact"
+      ? `**Technical Severity:** CVSS ${impact.cvss.version} ${impact.cvss.score?.toFixed(1)} ${impact.cvss.severity} — ${impact.cvss.vector}\n\n`
+      : impact.cvss.status === "range" && impact.cvss.lower_bound && impact.cvss.upper_bound
+        ? `**Technical Severity Range:** CVSS ${impact.cvss.version} ${impact.cvss.lower_bound.score.toFixed(1)}–${impact.cvss.upper_bound.score.toFixed(1)}; unresolved: ${impact.cvss.unresolved_metrics.join("; ")}\n\n`
+      : "") +
+    (questions ? `**One context check:** Reply once with answers to these questions.\n${questions}\n\n` : "") +
+    `**Matched CVEs:** ${result.matched_cves.length > 0 ? result.matched_cves.join(", ") : "None"}\n` +
+    `**Matched Techniques:** ${result.matched_techniques.length > 0 ? result.matched_techniques.join(", ") : "None"}\n` +
+    `**Missing Evidence:** ${result.missing_evidence.length > 0 ? result.missing_evidence.join("; ") : "None"}`
+  );
+}
+
+const CHAT_MODEL_STORAGE_KEY = "sentinel.chat.model.v1";
 
 // ── Conversation persistence ────────────────────────────────────────────────
 // The conversation used to live only in component state, so navigating to
@@ -201,6 +291,13 @@ function ChatPage() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [storageLoaded, setStorageLoaded] = useState(false);
   const [input, setInput] = useState("");
+  const [selectedModel, setSelectedModel] = useState(() => {
+    try {
+      return sessionStorage.getItem(CHAT_MODEL_STORAGE_KEY) || "auto";
+    } catch {
+      return "auto";
+    }
+  });
   const [files, setFiles] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [lastValidation, setLastValidation] = useState<ValidationResponse | null>(null);
@@ -260,6 +357,28 @@ function ChatPage() {
     queryFn: () => getSources(),
     refetchInterval: 60_000,
   });
+  const { data: appSettings } = useQuery<AppSettings>({
+    queryKey: ["settings"],
+    queryFn: getSettings,
+  });
+  const modelOptions = appSettings?.available_chat_models ?? [];
+  const selectedModelLabel =
+    selectedModel === "auto" ? "Auto" : modelLabel(selectedModel);
+
+  const selectModel = (model: string) => {
+    setSelectedModel(model);
+    try {
+      sessionStorage.setItem(CHAT_MODEL_STORAGE_KEY, model);
+    } catch {
+      // The in-memory selection remains usable when browser storage is blocked.
+    }
+  };
+
+  useEffect(() => {
+    if (appSettings && selectedModel !== "auto" && !modelOptions.includes(selectedModel)) {
+      selectModel("auto");
+    }
+  }, [appSettings, modelOptions, selectedModel]);
 
   const scrollToBottom = useCallback(() => {
     followLatestRef.current = true;
@@ -568,14 +687,7 @@ function ChatPage() {
     },
     onSuccess: (result) => {
       setLastValidation(result);
-      const summaryText =
-        `**Validation Complete**\n\n` +
-        `**Verdict:** ${result.verdict}  **Confidence:** ${Math.round(result.confidence * 100)}%\n\n` +
-        `**Reasoning:** ${result.reasoning}\n\n` +
-        `**Matched CVEs:** ${result.matched_cves.length > 0 ? result.matched_cves.join(", ") : "None"}\n` +
-        `**Matched Techniques:** ${result.matched_techniques.length > 0 ? result.matched_techniques.join(", ") : "None"}\n` +
-        `**Missing Evidence:** ${result.missing_evidence.length > 0 ? result.missing_evidence.join("; ") : "None"}\n` +
-        `**Next Steps:** ${result.recommended_next_steps.join("; ")}`;
+      const summaryText = validationSummary(result);
 
       setMessages((prev) => [
         ...prev,
@@ -621,6 +733,46 @@ function ChatPage() {
     onSettled: () => {
       setIsAnalyzingEvidence(false);
       setAnalysisFiles([]);
+    },
+  });
+
+  const refineImpactMutation = useMutation({
+    mutationFn: async ({ findingId, context }: { findingId: string; context: string }) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 90_000);
+      return refineFindingImpact(findingId, context, controller.signal).finally(() =>
+        window.clearTimeout(timeout),
+      );
+    },
+    onSuccess: (result) => {
+      setLastValidation(result);
+      setReadiness(null);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          from: "ai",
+          text: validationSummary(result),
+          provenance: result.sources
+            ? {
+                sources: result.sources,
+                sources_used: result.sources_used ?? [],
+                provenance: result.provenance ?? "",
+                degraded: result.degraded ?? false,
+                citations: result.citations ?? [],
+              }
+            : undefined,
+        },
+      ]);
+      toast.success("Business impact updated", {
+        description: `Priority: ${impactOf(result).business_priority.replace("_", " ")}`,
+      });
+      scrollToBottom();
+    },
+    onError: (error) => {
+      toast.error("Impact refinement failed", {
+        description: error instanceof Error ? error.message : "Could not update business impact.",
+      });
     },
   });
 
@@ -758,11 +910,15 @@ function ChatPage() {
           streamInFlightRef.current = false;
           stopStreamRef.current = null;
         },
+        (generation) => {
+          setMessages((prev) => prev.map((m) => (m.id === aiMsgId ? { ...m, generation } : m)));
+        },
+        selectedModel === "auto" ? undefined : selectedModel,
       );
 
       stopStreamRef.current = stop;
     },
-    [scrollToBottom, followStream],
+    [scrollToBottom, followStream, selectedModel],
   );
 
   const onDrop = useCallback((e: React.DragEvent) => {
@@ -796,6 +952,15 @@ function ChatPage() {
         description: capturedInput || "Analyze attached evidence files",
         evidenceFiles: capturedFiles,
       });
+    } else if (
+      capturedInput.trim() &&
+      lastValidation?.finding_id &&
+      impactOf(lastValidation).clarification_questions.length > 0
+    ) {
+      refineImpactMutation.mutate({
+        findingId: lastValidation.finding_id,
+        context: capturedInput,
+      });
     } else if (capturedInput.trim()) {
       // Text only → streaming chat
       const history = messages
@@ -807,7 +972,17 @@ function ChatPage() {
       history.push({ role: "user", content: capturedInput });
       sendStream(history);
     }
-  }, [input, files, messages, isStreaming, validateMutation, sendStream, scrollToBottom]);
+  }, [
+    input,
+    files,
+    messages,
+    isStreaming,
+    lastValidation,
+    refineImpactMutation,
+    validateMutation,
+    sendStream,
+    scrollToBottom,
+  ]);
 
   // Tick a waiting-for-LLM elapsed counter so the user knows the AI is queuing.
   useEffect(() => {
@@ -822,7 +997,7 @@ function ChatPage() {
     return () => window.clearInterval(timer);
   }, [isWaitingForFirstToken]);
 
-  const isLoading = isStreaming || isAnalyzingEvidence;
+  const isLoading = isStreaming || isAnalyzingEvidence || refineImpactMutation.isPending;
 
   return (
     <AppShell>
@@ -991,6 +1166,24 @@ function ChatPage() {
                         <>
                           <Sparkles className="h-3 w-3 text-brand-cyan" />
                           Sentinel
+                          {m.generation && (
+                            <span
+                              className={cn(
+                                "border px-1.5 py-0.5 text-[10px] font-medium",
+                                m.generation.fallback_used
+                                  ? "border-sev-medium/40 bg-sev-medium/10 text-sev-medium"
+                                  : "border-border bg-white text-muted-foreground",
+                              )}
+                              title={
+                                m.generation.fallback_used
+                                  ? `Fallback from ${m.generation.primary_model}`
+                                  : `Provider: ${m.generation.provider}`
+                              }
+                            >
+                              {modelLabel(m.generation.model)}
+                              {m.generation.fallback_used ? " · fallback" : ""}
+                            </span>
+                          )}
                           {m.streaming && (
                             <span className="ml-1 inline-block h-2 w-2 rounded-full bg-brand-cyan animate-pulse" />
                           )}
@@ -1179,6 +1372,51 @@ function ChatPage() {
                       <Paperclip className="h-4 w-4 mr-1" />
                       Attach
                     </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={isLoading || modelOptions.length === 0}
+                          className="max-w-52 gap-1.5"
+                        >
+                          <Sparkles className="h-3.5 w-3.5 text-brand-cyan" />
+                          <span className="truncate">{selectedModelLabel}</span>
+                          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start" side="top" className="w-80">
+                        <DropdownMenuLabel>
+                          <span className="block text-xs">Response model</span>
+                          <span className="mt-0.5 block text-[10px] font-normal text-muted-foreground">
+                            Auto recovers the primary and fails over on capacity errors.
+                          </span>
+                        </DropdownMenuLabel>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuRadioGroup value={selectedModel} onValueChange={selectModel}>
+                          <DropdownMenuRadioItem value="auto">
+                            <div>
+                              <div className="text-xs font-semibold">Auto</div>
+                              <div className="text-[10px] text-muted-foreground">
+                                Primary with automatic fallback
+                              </div>
+                            </div>
+                          </DropdownMenuRadioItem>
+                          {modelOptions.map((model, index) => (
+                            <DropdownMenuRadioItem key={model} value={model}>
+                              <div className="min-w-0">
+                                <div className="truncate text-xs font-semibold">
+                                  {modelLabel(model)}
+                                </div>
+                                <div className="truncate text-[10px] text-muted-foreground">
+                                  {index === 0 ? "Primary · manual" : "Fallback · manual"} · {model}
+                                </div>
+                              </div>
+                            </DropdownMenuRadioItem>
+                          ))}
+                        </DropdownMenuRadioGroup>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                     <span className="hidden text-[11px] text-muted-foreground sm:inline">
                       or drop files here
                     </span>
@@ -1325,6 +1563,7 @@ function EvidencePanel({
   canEvaluate: boolean;
   onBuildReport: () => void;
 }) {
+  const impact = lastValidation ? impactOf(lastValidation) : null;
   return (
     <div className="space-y-6">
       <div>
@@ -1374,10 +1613,93 @@ function EvidencePanel({
                 />
                 <Metric
                   icon={GitBranch}
-                  label="Next Steps"
-                  value={String(lastValidation.recommended_next_steps?.length || 0)}
+                  label="Business Priority"
+                  value={impact?.business_priority.replace("_", " ") || "pending context"}
                 />
               </div>
+              <div className="border-l-2 border-brand-cyan pl-3">
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Demonstrated capability
+                </div>
+                <p className="text-sm leading-relaxed text-foreground">
+                  {impact?.demonstrated_capability || "Not established"}
+                </p>
+              </div>
+              <div>
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Business impact
+                </div>
+                <p className="text-sm leading-relaxed text-muted-foreground">
+                  {impact?.business_impact || "Pending target context"}
+                </p>
+                {impact?.priority_rationale && (
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    {impact.priority_rationale}
+                  </p>
+                )}
+                <div className="mt-3 grid grid-cols-2 gap-3 border-t border-border pt-3 text-xs">
+                  <div>
+                    <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Technical severity
+                    </span>
+                    <span className="mt-1 block font-semibold text-foreground">
+                      {impact?.cvss.status === "exact"
+                        ? `CVSS ${impact.cvss.version} · ${impact.cvss.score?.toFixed(1)} ${impact.cvss.severity}`
+                        : impact?.cvss.status === "range" && impact.cvss.lower_bound && impact.cvss.upper_bound
+                          ? `CVSS ${impact.cvss.version} · ${impact.cvss.lower_bound.score.toFixed(1)}–${impact.cvss.upper_bound.score.toFixed(1)}`
+                        : "Pending evidence"}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="block text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      Business priority
+                    </span>
+                    <span className="mt-1 block font-semibold capitalize text-foreground">
+                      {impact?.business_priority.replace("_", " ")}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              {impact && impact.clarification_questions.length > 0 && (
+                <div className="border-t border-border pt-4">
+                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-brand-cyan">
+                    One context check
+                  </div>
+                  <p className="mb-2 text-xs text-muted-foreground">
+                    Reply once in chat with these answers. The assessment will update automatically.
+                  </p>
+                  <ol className="space-y-2 text-sm text-foreground">
+                    {impact.clarification_questions.map((item, index) => (
+                      <li key={item.question}>
+                        <span className="font-semibold">{index + 1}. {item.question}</span>
+                        {item.answer_options.length > 0 && (
+                          <span className="block text-xs text-muted-foreground">
+                            {item.answer_options.join(" · ")}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+              {(lastValidation.mappings ?? []).length > 0 && (
+                <div className="border-t border-border pt-4">
+                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                    Mapping applicability
+                  </div>
+                  <ul className="space-y-2 text-xs leading-relaxed">
+                    {(lastValidation.mappings ?? []).map((mapping) => (
+                      <li key={`${mapping.mapping_type}:${mapping.identifier}`}>
+                        <span className="font-semibold text-foreground">{mapping.identifier}</span>
+                        <span className="ml-2 capitalize text-brand-cyan">
+                          {mapping.applicability.replace("_", " ")}
+                        </span>
+                        <span className="block text-muted-foreground">{mapping.rationale}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <div>
                 <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                   Reasoning

@@ -14,11 +14,79 @@ import base64
 import json
 import logging
 import re
+import time
+import threading
 from typing import AsyncIterator, Optional
 
 from app.config import LLMProvider, settings
 
 log = logging.getLogger(__name__)
+
+_model_circuits: dict[tuple[str, str], float] = {}
+_model_probes: set[tuple[str, str]] = set()
+_circuit_lock = threading.RLock()
+
+
+def _is_retryable_provider_error(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status == 429 or isinstance(status, int) and 500 <= status < 600:
+        return True
+    text = str(exc).lower()
+    markers = (
+        "resourceexhausted",
+        "resource exhausted",
+        "request limit reached",
+        "rate limit",
+        "too many requests",
+        "temporarily unavailable",
+        "service unavailable",
+        "worker unavailable",
+        "worker local total request limit",
+        "upstream timeout",
+        "overloaded",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _model_available(provider: LLMProvider, model: str) -> bool:
+    key = (provider.value, model)
+    with _circuit_lock:
+        open_until = _model_circuits.get(key, 0.0)
+        if open_until and open_until <= time.monotonic():
+            _model_circuits.pop(key, None)
+            if key in _model_probes:
+                return False
+            _model_probes.add(key)
+            return True
+        return not open_until and key not in _model_probes
+
+
+def _open_model_circuit(provider: LLMProvider, model: str) -> None:
+    with _circuit_lock:
+        _model_probes.discard((provider.value, model))
+        _model_circuits[(provider.value, model)] = (
+            time.monotonic() + settings.LLM_MODEL_COOLDOWN_SECONDS
+        )
+
+
+def _close_model_circuit(provider: LLMProvider, model: str) -> None:
+    with _circuit_lock:
+        _model_probes.discard((provider.value, model))
+        _model_circuits.pop((provider.value, model), None)
+
+
+def _model_chain(provider: LLMProvider, role: str, primary: str) -> list[str]:
+    fallbacks = getattr(
+        settings,
+        f"{provider.value.upper()}_{role.upper()}_FALLBACK_MODELS",
+        [],
+    )
+    return list(dict.fromkeys(model for model in [primary, *fallbacks] if model))
+
+
+def configured_chat_models(provider: LLMProvider | None = None) -> list[str]:
+    provider = provider or _get_active_provider()
+    return _model_chain(provider, "chat", _get_model(provider, "chat"))
 
 # ── Retry helpers ─────────────────────────────────────────────────────────────
 
@@ -109,6 +177,16 @@ class AsyncLLMClient:
 
     def __init__(self, provider: Optional[LLMProvider] = None):
         self.provider = provider or _get_active_provider()
+        self.last_generation: dict | None = None
+        self.last_finish_reason: str | None = None
+
+    def _record_generation(self, model: str, primary: str) -> None:
+        self.last_generation = {
+            "provider": self.provider.value,
+            "model": model,
+            "primary_model": primary,
+            "fallback_used": model != primary,
+        }
 
     # ── Internal client builders (lazy, not cached — async-safe) ──────────
 
@@ -158,20 +236,60 @@ class AsyncLLMClient:
         model: Optional[str] = None,
     ) -> str:
         p = self.provider
-        m = model or _get_model(p, "chat")
+        primary = model or _get_model(p, "chat")
+        models = [primary] if model else _model_chain(p, "chat", primary)
+        return await self._generate_with_fallback(messages, system, max_tokens, models)
 
-        async def _call():
-            if p == LLMProvider.anthropic:
-                return await self._generate_anthropic(messages, system, max_tokens, m)
-            elif p in (LLMProvider.openai, LLMProvider.together,
-                       LLMProvider.openrouter, LLMProvider.ollama):
-                return await self._generate_openai_compat(messages, system, max_tokens, m, p)
-            elif p == LLMProvider.gemini:
-                return await self._generate_gemini(messages, system, max_tokens, m)
-            else:
-                raise ValueError(f"Unknown provider: {p}")
+    async def _generate_with_fallback(
+        self,
+        messages: list[dict],
+        system: str,
+        max_tokens: int,
+        models: list[str],
+    ) -> str:
+        last_error: Exception | None = None
+        attempted = False
+        primary = models[0]
+        for model in models:
+            if not _model_available(self.provider, model):
+                continue
+            attempted = True
+            for attempt in range(settings.LLM_CAPACITY_RETRIES + 1):
+                try:
+                    result = await self._generate_model(messages, system, max_tokens, model)
+                    _close_model_circuit(self.provider, model)
+                    self._record_generation(model, primary)
+                    return result
+                except Exception as exc:
+                    if not _is_retryable_provider_error(exc):
+                        _close_model_circuit(self.provider, model)
+                        raise
+                    last_error = exc
+                    if attempt < settings.LLM_CAPACITY_RETRIES:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+            _open_model_circuit(self.provider, model)
+            log.warning("Model %s is temporarily unavailable; trying fallback", model)
 
-        return await _with_retry(_call)
+        if not attempted:
+            raise RuntimeError("All configured models are cooling down")
+        raise RuntimeError("All configured models are temporarily unavailable") from last_error
+
+    async def _generate_model(
+        self, messages: list[dict], system: str, max_tokens: int, model: str
+    ) -> str:
+        p = self.provider
+        if p == LLMProvider.anthropic:
+            return await self._generate_anthropic(messages, system, max_tokens, model)
+        if p in (
+            LLMProvider.openai,
+            LLMProvider.together,
+            LLMProvider.openrouter,
+            LLMProvider.ollama,
+        ):
+            return await self._generate_openai_compat(messages, system, max_tokens, model, p)
+        if p == LLMProvider.gemini:
+            return await self._generate_gemini(messages, system, max_tokens, model)
+        raise ValueError(f"Unknown provider: {p}")
 
     async def _generate_anthropic(
         self, messages: list[dict], system: str, max_tokens: int, model: str
@@ -183,6 +301,7 @@ class AsyncLLMClient:
             system=system,
             messages=[{"role": m["role"], "content": m["content"]} for m in messages],
         )
+        self.last_finish_reason = getattr(resp, "stop_reason", None)
         return resp.content[0].text
 
     async def _generate_openai_compat(
@@ -208,6 +327,7 @@ class AsyncLLMClient:
             messages=full_messages,
             max_tokens=max_tokens,
         )
+        self.last_finish_reason = getattr(resp.choices[0], "finish_reason", None)
         return resp.choices[0].message.content or ""
 
     async def _generate_gemini(
@@ -225,6 +345,11 @@ class AsyncLLMClient:
             contents=gemini_messages,
             config={"max_output_tokens": max_tokens, "system_instruction": system},
         )
+        candidate = resp.candidates[0] if getattr(resp, "candidates", None) else None
+        reason = getattr(candidate, "finish_reason", None)
+        self.last_finish_reason = getattr(reason, "name", reason)
+        if isinstance(self.last_finish_reason, str):
+            self.last_finish_reason = self.last_finish_reason.lower()
         return resp.text
 
     # ── Streaming chat generation ──────────────────────────────────────────
@@ -238,19 +363,61 @@ class AsyncLLMClient:
     ) -> AsyncIterator[str]:
         """Yield text chunks for SSE streaming."""
         p = self.provider
-        m = model or _get_model(p, "chat")
+        primary = model or _get_model(p, "chat")
+        models = [primary] if model else _model_chain(p, "chat", primary)
+        last_error: Exception | None = None
+        attempted = False
+        primary_model = models[0]
 
+        for candidate in models:
+            if not _model_available(p, candidate):
+                continue
+            attempted = True
+            emitted = False
+            try:
+                async for chunk in self._stream_model(
+                    messages, system, max_tokens, candidate
+                ):
+                    if not emitted:
+                        self._record_generation(candidate, primary_model)
+                    emitted = True
+                    yield chunk
+                _close_model_circuit(p, candidate)
+                if not emitted:
+                    self._record_generation(candidate, primary_model)
+                return
+            except Exception as exc:
+                if emitted or not _is_retryable_provider_error(exc):
+                    _close_model_circuit(p, candidate)
+                    raise
+                last_error = exc
+                _open_model_circuit(p, candidate)
+                log.warning("Streaming model %s unavailable; trying fallback", candidate)
+
+        if not attempted:
+            raise RuntimeError("All configured models are cooling down")
+        raise RuntimeError("All configured models are temporarily unavailable") from last_error
+
+    async def _stream_model(
+        self, messages: list[dict], system: str, max_tokens: int, model: str
+    ) -> AsyncIterator[str]:
+        p = self.provider
         if p == LLMProvider.anthropic:
-            async for chunk in self._stream_anthropic(messages, system, max_tokens, m):
+            async for chunk in self._stream_anthropic(messages, system, max_tokens, model):
                 yield chunk
-        elif p in (LLMProvider.openai, LLMProvider.together,
-                   LLMProvider.openrouter, LLMProvider.ollama):
-            async for chunk in self._stream_openai_compat(messages, system, max_tokens, m, p):
+            return
+        if p in (
+            LLMProvider.openai,
+            LLMProvider.together,
+            LLMProvider.openrouter,
+            LLMProvider.ollama,
+        ):
+            async for chunk in self._stream_openai_compat(
+                messages, system, max_tokens, model, p
+            ):
                 yield chunk
-        else:
-            # Gemini / fallback: non-streaming
-            text = await self.generate(messages, system, max_tokens, m)
-            yield text
+            return
+        yield await self._generate_model(messages, system, max_tokens, model)
 
     async def _stream_anthropic(
         self, messages: list[dict], system: str, max_tokens: int, model: str
@@ -264,6 +431,8 @@ class AsyncLLMClient:
         ) as stream:
             async for text in stream.text_stream:
                 yield text
+            final = await stream.get_final_message()
+            self.last_finish_reason = getattr(final, "stop_reason", None)
 
     async def _stream_openai_compat(
         self, messages: list[dict], system: str, max_tokens: int,
@@ -289,10 +458,14 @@ class AsyncLLMClient:
             max_tokens=max_tokens,
             stream=True,
         )
+        self.last_finish_reason = None
         async for chunk in stream:
             delta = chunk.choices[0].delta.content
             if delta:
                 yield delta
+            finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+            if finish_reason:
+                self.last_finish_reason = finish_reason
 
     # ── Validation generation (structured JSON output) ────────────────────
 
@@ -307,7 +480,8 @@ class AsyncLLMClient:
         Uses structured output where available; retries on JSON parse failure.
         """
         p = self.provider
-        m = _get_model(p, "validation")
+        primary = _get_model(p, "validation")
+        models = _model_chain(p, "validation", primary)
 
         # Bound before the loop so the failure log below is always reportable.
         # `generate` itself can raise ValueError (a refusal, an empty
@@ -320,11 +494,11 @@ class AsyncLLMClient:
 
         for attempt in range(3):
             try:
-                raw = await self.generate(
-                    messages=[{"role": "user", "content": user_message}],
-                    system=system,
-                    max_tokens=max_tokens,
-                    model=m,
+                raw = await self._generate_with_fallback(
+                    [{"role": "user", "content": user_message}],
+                    system,
+                    max_tokens,
+                    models,
                 )
                 return _extract_json(raw)
             except (json.JSONDecodeError, ValueError) as exc:
@@ -347,13 +521,12 @@ class AsyncLLMClient:
 
     async def describe_image(self, image_bytes: bytes, media_type: str) -> str:
         p = self.provider
-        models = [_get_model(p, "vision")]
-        if p == LLMProvider.openrouter:
-            models.extend(settings.OPENROUTER_VISION_FALLBACK_MODELS)
-        models = list(dict.fromkeys(model for model in models if model))
+        models = _model_chain(p, "vision", _get_model(p, "vision"))
 
         last_error: Exception | None = None
         for model in models:
+            if not _model_available(p, model):
+                continue
             try:
                 async def _call():
                     if p == LLMProvider.anthropic:
@@ -371,9 +544,24 @@ class AsyncLLMClient:
                         return await self._describe_image_gemini(image_bytes, media_type, model)
                     raise ValueError(f"Vision not supported for provider: {p}")
 
-                return await _with_retry(_call, retries=2)
+                for attempt in range(settings.LLM_CAPACITY_RETRIES + 1):
+                    try:
+                        result = await _call()
+                        _close_model_circuit(p, model)
+                        return result
+                    except Exception as exc:
+                        if not _is_retryable_provider_error(exc):
+                            _close_model_circuit(p, model)
+                            raise
+                        last_error = exc
+                        if attempt < settings.LLM_CAPACITY_RETRIES:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                raise last_error
             except Exception as exc:
+                if not _is_retryable_provider_error(exc):
+                    raise
                 last_error = exc
+                _open_model_circuit(p, model)
                 log.warning("Vision model %s failed: %s", model, exc)
 
         raise RuntimeError(

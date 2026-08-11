@@ -51,6 +51,7 @@ class Finding(Base):
     technical_evidence = Column(Text, nullable=True)
     reproduction_steps = Column(JSON, default=list, nullable=False)
     impact = Column(Text, nullable=True)
+    impact_assessment = Column(JSON, nullable=True)
     severity = Column(String, nullable=True)
     cvss_score = Column(Float, nullable=True)
     cvss_vector = Column(String, nullable=True)

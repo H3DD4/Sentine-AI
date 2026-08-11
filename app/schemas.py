@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from typing import Optional, List, Any, Literal
 from datetime import datetime
 from enum import Enum
@@ -9,6 +9,124 @@ class VerdictEnum(str, Enum):
     likely = "likely"
     insufficient = "insufficient"
     false_positive = "false_positive"
+
+
+class ImpactEvidenceLevel(str, Enum):
+    observed = "observed"
+    logically_demonstrated = "logically_demonstrated"
+    conditional = "conditional"
+
+
+class BusinessPriority(str, Enum):
+    critical = "critical"
+    high = "high"
+    moderate = "moderate"
+    low = "low"
+    pending_context = "pending_context"
+
+
+class ImpactClaim(BaseModel):
+    level: ImpactEvidenceLevel
+    statement: str
+    evidence_basis: str
+    conditions: List[str] = Field(default_factory=list)
+
+
+class ClarificationQuestion(BaseModel):
+    question: str
+    why_it_matters: str
+    answer_options: List[str] = Field(default_factory=list)
+
+
+class CVSSScenario(BaseModel):
+    label: str
+    vector: str
+    score: float = Field(ge=0, le=10)
+    severity: str
+    assumptions: List[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
+class CVSSAssessment(BaseModel):
+    status: Literal["exact", "range", "pending_evidence", "not_applicable"] = "pending_evidence"
+    version: Literal["4.0", "3.1", ""] = ""
+    vector: str = ""
+    score: Optional[float] = Field(default=None, ge=0, le=10)
+    severity: str = ""
+    rationale: str = ""
+    lower_bound: Optional[CVSSScenario] = None
+    upper_bound: Optional[CVSSScenario] = None
+    unresolved_metrics: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def enforce_score_shape(self):
+        if self.status == "exact":
+            if not self.vector or self.score is None or not self.version:
+                raise ValueError("Exact CVSS requires version, vector, and score")
+            self.lower_bound = None
+            self.upper_bound = None
+            self.unresolved_metrics = []
+        elif self.status == "range":
+            if self.lower_bound is None or self.upper_bound is None:
+                raise ValueError("CVSS range requires lower and upper scenarios")
+            if self.lower_bound.score > self.upper_bound.score:
+                raise ValueError("CVSS lower bound cannot exceed upper bound")
+            if not self.unresolved_metrics:
+                raise ValueError("CVSS range must identify unresolved metrics")
+            self.vector = ""
+            self.score = None
+            self.severity = ""
+        else:
+            self.vector = ""
+            self.score = None
+            self.severity = ""
+            self.lower_bound = None
+            self.upper_bound = None
+        return self
+
+
+class SecurityMapping(BaseModel):
+    mapping_type: Literal["cve", "cwe", "owasp", "attack"]
+    identifier: str
+    name: str = ""
+    applicability: Literal["direct", "supporting", "conditional", "rejected", "unsupported"]
+    rationale: str
+    evidence_basis: str = ""
+    source: str = ""
+    source_doc_id: str = ""
+
+
+class ImpactAssessment(BaseModel):
+    demonstrated_capability: str = ""
+    technical_impact: str = ""
+    affected_assets: List[str] = Field(default_factory=list)
+    affected_data: List[str] = Field(default_factory=list)
+    affected_business_processes: List[str] = Field(default_factory=list)
+    business_impact: str = ""
+    business_priority: BusinessPriority = BusinessPriority.pending_context
+    priority_rationale: str = ""
+    cvss: CVSSAssessment = Field(default_factory=CVSSAssessment)
+    claims: List[ImpactClaim] = Field(default_factory=list)
+    excluded_claims: List[str] = Field(default_factory=list)
+    assumptions: List[str] = Field(default_factory=list)
+    clarification_questions: List[ClarificationQuestion] = Field(default_factory=list, max_length=3)
+    context_complete: bool = False
+
+    @field_validator("clarification_questions")
+    @classmethod
+    def limit_clarification_questions(
+        cls, questions: List[ClarificationQuestion]
+    ) -> List[ClarificationQuestion]:
+        if len(questions) > 3:
+            raise ValueError("At most three clarification questions may be asked")
+        return questions
+
+    @model_validator(mode="after")
+    def keep_context_state_consistent(self):
+        if self.clarification_questions:
+            self.context_complete = False
+            self.business_priority = BusinessPriority.pending_context
+        return self
 
 class Token(BaseModel):
     access_token: str
@@ -78,8 +196,10 @@ class ValidationResult(BaseModel):
     reasoning: str
     matched_cves: List[str]
     matched_techniques: List[str]
+    mappings: List[SecurityMapping] = Field(default_factory=list)
     missing_evidence: List[str]
     recommended_next_steps: List[str]
+    impact_assessment: ImpactAssessment = Field(default_factory=ImpactAssessment)
 
 
 class SourceStatus(BaseModel):
@@ -121,6 +241,18 @@ class ValidationResponse(ValidationResult):
     processing: Optional[dict] = None
 
 
+class ImpactRefinementRequest(BaseModel):
+    context: str
+
+    @field_validator("context")
+    @classmethod
+    def validate_context(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Business context is required")
+        return value[:24_000]
+
+
 class FindingCreate(BaseModel):
     title: str
     description: str
@@ -131,6 +263,7 @@ class FindingCreate(BaseModel):
     technical_evidence: str = ""
     reproduction_steps: List[str] = []
     impact: str = ""
+    impact_assessment: Optional[ImpactAssessment] = None
     severity: str = ""
     cvss_score: Optional[float] = None
     cvss_vector: str = ""
@@ -151,6 +284,7 @@ class FindingUpdate(BaseModel):
     technical_evidence: Optional[str] = None
     reproduction_steps: Optional[List[str]] = None
     impact: Optional[str] = None
+    impact_assessment: Optional[ImpactAssessment] = None
     severity: Optional[str] = None
     cvss_score: Optional[float] = None
     cvss_vector: Optional[str] = None
@@ -186,6 +320,7 @@ class FindingOut(BaseModel):
     technical_evidence: Optional[str] = None
     reproduction_steps: List[str] = []
     impact: Optional[str] = None
+    impact_assessment: Optional[ImpactAssessment] = None
     severity: Optional[str] = None
     cvss_score: Optional[float] = None
     cvss_vector: Optional[str] = None
@@ -220,6 +355,7 @@ class ChatRequest(BaseModel):
     finding_id: Optional[str] = None
     action: Optional[str] = None
     title: Optional[str] = None
+    model: Optional[str] = None
 
 class ConversationState(BaseModel):
     title: Optional[str] = None
@@ -277,7 +413,10 @@ class ReportRequest(BaseModel):
     engagement_title: str
     client_name: str
     draft: Optional[ReportDraft] = None
+    draft_finding_id: Optional[str] = None
     template_id: Optional[str] = None
+    force_export: bool = False
+    acknowledge_incomplete: bool = False
     sections: List[Literal[
         "executive_summary",
         "scope_methodology",
@@ -388,6 +527,7 @@ class EngagementOut(BaseModel):
 class SettingsOut(BaseModel):
     # Provider selection
     llm_provider: str = "anthropic"
+    available_chat_models: List[str] = []
     anthropic_api_key_set: bool = False
     openai_api_key_set: bool = False
     together_api_key_set: bool = False
@@ -412,6 +552,9 @@ class SettingsOut(BaseModel):
     openrouter_chat_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     openrouter_validation_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     openrouter_vision_model: str = "microsoft/phi-3-vision-128k-instruct:free"
+    openrouter_chat_fallback_models: List[str] = []
+    openrouter_validation_fallback_models: List[str] = []
+    openrouter_vision_fallback_models: List[str] = []
 
     ollama_base_url: str = "http://localhost:11434"
     ollama_chat_model: str = "llama3.2"

@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     # precision for latency.
     RERANK_ENABLED: bool = True
     RERANK_CANDIDATES: int = 15
-    RERANK_TIMEOUT_SECONDS: float = 3.0
+    # CPU inference for 15 cross-encoder pairs takes well over three seconds on
+    # typical analyst workstations. A timeout below that silently forces every
+    # query onto the lower-precision fusion fallback.
+    RERANK_TIMEOUT_SECONDS: float = 30.0
     # Whether model loading may reach the network.
     #
     # Off by default, and that default is deliberate: a model that is not in
@@ -46,6 +49,8 @@ class Settings(BaseSettings):
     # LLM Provider Selection
     LLM_PROVIDER: LLMProvider = LLMProvider.anthropic
     LLM_REQUEST_TIMEOUT_SECONDS: float = 45.0
+    CHAT_MAX_TOKENS: int = 6000
+    CHAT_MAX_CONTINUATIONS: int = 2
     VISION_STAGE_TIMEOUT_SECONDS: float = 30.0
     VALIDATION_STAGE_TIMEOUT_SECONDS: float = 45.0
 
@@ -73,9 +78,13 @@ class Settings(BaseSettings):
     OPENROUTER_CHAT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     OPENROUTER_VALIDATION_MODEL: str = "google/gemini-2.5-flash-lite"
     OPENROUTER_VISION_MODEL: str = "google/gemini-2.5-flash-lite"
+    OPENROUTER_CHAT_FALLBACK_MODELS: list[str] = ["google/gemini-2.5-flash-lite"]
+    OPENROUTER_VALIDATION_FALLBACK_MODELS: list[str] = []
     OPENROUTER_VISION_FALLBACK_MODELS: list[str] = [
         "nvidia/nemotron-nano-12b-v2-vl:free"
     ]
+    LLM_MODEL_COOLDOWN_SECONDS: float = 120.0
+    LLM_CAPACITY_RETRIES: int = 1
 
     # Ollama (local)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
@@ -116,6 +125,7 @@ class Settings(BaseSettings):
     # Ghostwriter
     GHOSTWRITER_URL: str = ""
     GHOSTWRITER_API_KEY: str = ""
+    GHOSTWRITER_VERIFY_TLS: bool = True
 
     # Auth (JWT)
     SECRET_KEY: str = "change-me-in-production"

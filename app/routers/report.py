@@ -5,14 +5,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from app.db import get_session
 from app.config import settings
-from app.models import AuditLog, Finding, GeneratedReport, ReportTemplate
+from app.auth import get_current_active_user
+from app.models import AuditLog, Finding, GeneratedReport, ReportTemplate, User
 from app.schemas import ChatRequest, GeneratedReportOut, ReportRequest, ReportTemplateOut
 from app.services.report import generate_report_docx
 from app.services.report_readiness import (
+    FORCE_EXPORT_THRESHOLD,
     assess_conversation,
     draft_to_finding,
     finding_evidence_context,
     finding_report_draft,
+    score_report_draft,
 )
 import hashlib
 import os
@@ -193,11 +196,14 @@ async def assess_report_readiness(
 async def generate_report(
     req: ReportRequest,
     session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_active_user),
 ):
     findings = []
     if req.finding_ids:
         result = await session.execute(
-            select(Finding).where(Finding.id.in_(req.finding_ids))
+            select(Finding)
+            .options(selectinload(Finding.evidence))
+            .where(Finding.id.in_(req.finding_ids))
         )
         loaded = list(result.scalars().all())
         by_id = {finding.id: finding for finding in loaded}
@@ -213,16 +219,7 @@ async def generate_report(
     if not findings:
         raise HTTPException(400, "Select at least one finding or provide an eligible conversation draft")
 
-    incomplete = []
-    for finding in findings:
-        missing = _missing_report_fields(finding)
-        if missing:
-            incomplete.append(f"{finding.title}: {', '.join(missing)}")
-    if incomplete:
-        raise HTTPException(
-            422,
-            "Complete the selected findings before export. " + " | ".join(incomplete),
-        )
+    overrides = _validate_export_gate(req, findings)
 
     template = None
     if req.template_id:
@@ -270,6 +267,17 @@ async def generate_report(
         draft_snapshot=req.draft.model_dump(mode="json") if req.draft else None,
     )
     session.add(report)
+    for finding, score, missing in overrides:
+        finding_id = getattr(finding, "id", None) or req.draft_finding_id
+        session.add(_force_export_audit(
+            finding_id=finding_id,
+            finding_title=finding.title,
+            user_id=current_user.id,
+            score=score,
+            missing=missing,
+            report_id=report_id,
+            filename=filename,
+        ))
     session.add(AuditLog(
         event_type="report_generated",
         input_hash=hashlib.sha256(docx_bytes).hexdigest(),
@@ -278,6 +286,7 @@ async def generate_report(
             "includes_draft": req.draft is not None,
             "template_id": template.id if template else None,
             "sections": req.sections,
+            "forced_export": bool(overrides),
         },
         result_summary={"report_id": report_id, "filename": filename},
     ))
@@ -303,6 +312,72 @@ def _missing_report_fields(finding: Finding) -> list[str]:
         "analyst verdict": _verdict(finding),
     }
     return [label for label, value in required.items() if not value or not str(value).strip()]
+
+
+def _validate_export_gate(
+    req: ReportRequest, findings: list[Finding]
+) -> list[tuple[Finding, float, list[str]]]:
+    """Return acknowledged overrides, or reject incomplete/weak exports."""
+    incomplete: list[tuple[Finding, float, list[str]]] = []
+    for finding in findings:
+        missing = _missing_report_fields(finding)
+        if missing:
+            score = score_report_draft(
+                finding_report_draft(finding, list(finding.evidence))
+            ).score
+            incomplete.append((finding, score, missing))
+
+    if not incomplete:
+        return []
+
+    details = " | ".join(
+        f"{finding.title} ({score:.1f}/10): {', '.join(missing)}"
+        for finding, score, missing in incomplete
+    )
+    below_threshold = [item for item in incomplete if item[1] < FORCE_EXPORT_THRESHOLD]
+    if below_threshold:
+        raise HTTPException(
+            422,
+            f"Export remains blocked below {FORCE_EXPORT_THRESHOLD:.1f}/10. "
+            f"Improve the finding or set an analyst verdict where missing. {details}",
+        )
+    if not req.force_export:
+        raise HTTPException(
+            422,
+            "Incomplete report content requires an explicit force export. " + details,
+        )
+    if not req.acknowledge_incomplete:
+        raise HTTPException(
+            422,
+            "Confirm that you acknowledge the incomplete sections before force export.",
+        )
+    return incomplete
+
+
+def _force_export_audit(
+    *,
+    finding_id: str | None,
+    finding_title: str,
+    user_id: str,
+    score: float,
+    missing: list[str],
+    report_id: str,
+    filename: str,
+) -> AuditLog:
+    return AuditLog(
+        event_type="report_force_export",
+        finding_id=finding_id,
+        user_id=user_id,
+        input_hash=hashlib.sha256(
+            f"{report_id}:{finding_id or finding_title}:{score}".encode()
+        ).hexdigest(),
+        payload_summary={
+            "confidence_score": score,
+            "incomplete_sections": missing,
+            "acknowledged": True,
+        },
+        result_summary={"report_id": report_id, "filename": filename},
+    )
 
 
 def _verdict(finding: Finding) -> str:

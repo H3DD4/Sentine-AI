@@ -18,6 +18,7 @@ from app.services.llm_client import AsyncLLMClient
 
 
 READINESS_THRESHOLD = 3.5
+FORCE_EXPORT_THRESHOLD = 5.0
 log = logging.getLogger(__name__)
 _SOCIAL_TURNS = {
     "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
@@ -222,6 +223,7 @@ def finding_evidence_context(finding: Finding, evidence: list[Evidence]) -> str:
         f"Validation verdict: {getattr(finding.verdict, 'value', finding.verdict) or ''}",
         f"Validation confidence: {finding.confidence if finding.confidence is not None else ''}",
         f"Validation reasoning: {finding.reasoning or ''}",
+        f"Structured impact assessment: {finding.impact_assessment or ''}",
     ]
     for item in evidence:
         content = item.image_description or item.extracted_text

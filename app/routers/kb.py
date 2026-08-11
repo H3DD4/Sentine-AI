@@ -19,10 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.kb.indexer import delete_document, index_rows, reindex_source
-from app.kb.models import InternalDoc
+from app.kb.models import GhostwriterFinding, InternalDoc
 from app.kb.registry import all_sources, get_health, get_source, source_keys
 from app.schemas import KBEntryCreate
 from app.services.retrieval import federated_search, get_qdrant
+from app.services.ghostwriter_client import get_findings as get_ghostwriter_findings
 
 router = APIRouter(prefix="/kb", tags=["knowledge-base"])
 
@@ -67,8 +68,12 @@ async def reindex(
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from None
 
+    imported = 0
+    if source_key == "ghostwriter":
+        imported = await _sync_ghostwriter_findings(session)
+
     stats = await reindex_source(source, session, get_qdrant(), force=force)
-    return {"source": source_key, **stats.to_dict()}
+    return {"source": source_key, "imported": imported, **stats.to_dict()}
 
 
 # ── Search ───────────────────────────────────────────────────────────────────
@@ -235,3 +240,45 @@ def _serialize(src, row) -> dict:
     payload["description"] = desc[:500]
     payload["synced"] = getattr(row, "qdrant_synced_at", None) is not None
     return payload
+
+
+async def _sync_ghostwriter_findings(session: AsyncSession) -> int:
+    upstream = await get_ghostwriter_findings()
+    gw_ids = [str(item["id"]) for item in upstream]
+    existing = {}
+    if gw_ids:
+        rows = (
+            await session.execute(
+                select(GhostwriterFinding).where(GhostwriterFinding.gw_id.in_(gw_ids))
+            )
+        ).scalars().all()
+        existing = {row.gw_id: row for row in rows}
+
+    for item in upstream:
+        gw_id = str(item["id"])
+        row = existing.get(gw_id)
+        if row is None:
+            row = GhostwriterFinding(id=f"gw-{gw_id}", gw_id=gw_id)
+            session.add(row)
+        references = item.get("references") or ""
+        row.title = item.get("title") or ""
+        row.description = item.get("description") or ""
+        row.severity = (item.get("severity") or {}).get("severity")
+        row.cvss_score = item.get("cvssScore")
+        row.finding_type = (item.get("type") or {}).get("findingType")
+        row.replication_steps = item.get("replication_steps") or ""
+        row.mitigation = item.get("mitigation") or ""
+        row.impact = item.get("impact") or ""
+        row.host_detection = item.get("hostDetectionTechniques") or ""
+        row.network_detection = item.get("networkDetectionTechniques") or ""
+        row.cve_refs = [
+            token.strip(".,;()[]")
+            for token in references.replace("\n", " ").split()
+            if token.upper().startswith("CVE-")
+        ]
+        row.affected_entities = []
+        row.tags = []
+        row.mitre_techniques = []
+
+    await session.commit()
+    return len(upstream)

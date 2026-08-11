@@ -9,10 +9,11 @@ Changes:
 """
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
-from app.schemas import ValidationResponse
-from app.services.validation import validate_finding
+from app.schemas import ImpactRefinementRequest, ValidationResponse
+from app.services.validation import impact_narrative, validate_finding
 from app.services.upload_processing import (
     cleanup_staged_evidence,
     move_staged_evidence,
@@ -20,9 +21,31 @@ from app.services.upload_processing import (
 )
 from app.models import Finding, Evidence, AuditLog
 import hashlib
+import json
 import time
 
 router = APIRouter(prefix="/validate", tags=["validation"])
+
+
+def _legacy_cvss(result):
+    cvss = result.impact_assessment.cvss
+    if cvss.status != "exact":
+        return "", None, ""
+    return cvss.severity, cvss.score, cvss.vector
+
+
+def _validation_response(result, outcome, finding_id: str, processing: dict | None = None):
+    data = outcome.to_dict()
+    return ValidationResponse(
+        **result.model_dump(),
+        finding_id=finding_id,
+        sources=data["sources"],
+        sources_used=data["sources_used"],
+        provenance=data["provenance"],
+        degraded=data["degraded"],
+        citations=data["results"],
+        processing=processing,
+    )
 
 @router.post("", response_model=ValidationResponse)
 async def validate_endpoint(
@@ -57,6 +80,7 @@ async def validate_endpoint(
         raise
 
     # Persist finding
+    severity, cvss_score, cvss_vector = _legacy_cvss(result)
     finding = Finding(
         title=title,
         description=description,
@@ -64,6 +88,11 @@ async def validate_endpoint(
         confidence=result.confidence,
         reasoning=result.reasoning,
         technical_evidence=persisted_evidence,
+        impact=impact_narrative(result),
+        impact_assessment=result.impact_assessment.model_dump(mode="json"),
+        severity=severity,
+        cvss_score=cvss_score,
+        cvss_vector=cvss_vector,
         matched_cves=result.matched_cves,
         matched_techniques=result.matched_techniques,
         missing_evidence=result.missing_evidence,
@@ -99,6 +128,8 @@ async def validate_endpoint(
             result_summary={
                 "verdict": result.verdict,
                 "confidence": result.confidence,
+                "business_priority": result.impact_assessment.business_priority.value,
+                "business_context_complete": result.impact_assessment.context_complete,
                 "sources_used": outcome.sources_used,
                 "degraded": outcome.degraded,
                 "provenance": outcome.provenance_line(),
@@ -111,19 +142,66 @@ async def validate_endpoint(
         await session.rollback()
         raise
 
-    data = outcome.to_dict()
     response.headers["Server-Timing"] = (
         f"evidence;dur={(processing_finished - request_started) * 1000:.0f}, "
         f"validation;dur={(validation_finished - processing_finished) * 1000:.0f}, "
         f"persistence;dur={(persistence_finished - validation_finished) * 1000:.0f}"
     )
-    return ValidationResponse(
-        **result.model_dump(),
-        finding_id=finding.id,
-        sources=data["sources"],
-        sources_used=data["sources_used"],
-        provenance=data["provenance"],
-        degraded=data["degraded"],
-        citations=data["results"],
-        processing=processing,
+    return _validation_response(result, outcome, finding.id, processing)
+
+
+@router.post("/{finding_id}/impact", response_model=ValidationResponse)
+async def refine_impact_endpoint(
+    finding_id: str,
+    request: ImpactRefinementRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    finding = await session.get(Finding, finding_id)
+    if finding is None:
+        raise HTTPException(404, "Finding not found")
+
+    evidence = list((await session.scalars(
+        select(Evidence).where(Evidence.finding_id == finding_id)
+    )).all())
+    evidence_texts = [item.extracted_text for item in evidence if item.extracted_text]
+    image_descriptions = [item.image_description for item in evidence if item.image_description]
+    prior_context = finding.impact_assessment or {}
+    description = (
+        f"{finding.description}\n\n"
+        "=== PRIOR IMPACT ASSESSMENT ===\n"
+        f"{json.dumps(prior_context, indent=2)}\n\n"
+        "=== ANALYST-PROVIDED TARGET AND BUSINESS CONTEXT ===\n"
+        f"{request.context}"
     )
+    result, outcome = await validate_finding(
+        description, evidence_texts, image_descriptions, session
+    )
+
+    finding.verdict = result.verdict
+    finding.confidence = result.confidence
+    finding.reasoning = result.reasoning
+    finding.impact = impact_narrative(result)
+    finding.impact_assessment = result.impact_assessment.model_dump(mode="json")
+    severity, cvss_score, cvss_vector = _legacy_cvss(result)
+    finding.severity = severity
+    finding.cvss_score = cvss_score
+    finding.cvss_vector = cvss_vector
+    finding.matched_cves = result.matched_cves
+    finding.matched_techniques = result.matched_techniques
+    finding.missing_evidence = result.missing_evidence
+    finding.recommended_next_steps = result.recommended_next_steps
+    session.add(AuditLog(
+        event_type="impact_refinement",
+        finding_id=finding.id,
+        input_hash=hashlib.sha256(request.context.encode()).hexdigest()[:16],
+        payload_summary={"context_chars": len(request.context)},
+        result_summary={
+            "verdict": result.verdict.value,
+            "confidence": result.confidence,
+            "business_priority": result.impact_assessment.business_priority.value,
+            "business_context_complete": result.impact_assessment.context_complete,
+            "provenance": outcome.provenance_line(),
+        },
+    ))
+    await session.commit()
+    return _validation_response(result, outcome, finding.id)

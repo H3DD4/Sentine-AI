@@ -78,6 +78,7 @@ function suggestedTarget(handoff: ConversationReportHandoff | null): string {
 
 function findingReportGaps(finding: Finding): string[] {
   return [
+    ["title", finding.title],
     ["description", finding.description],
     ["affected scope", finding.affected_scope],
     ["technical evidence", finding.technical_evidence],
@@ -93,6 +94,7 @@ function draftReportGaps(handoff: ConversationReportHandoff | null): string[] {
   if (!handoff) return [];
   const draft = handoff.readiness.draft;
   return [
+    ["title", draft.title],
     ["description", draft.description],
     ["affected scope", draft.affected_scope],
     ["technical evidence", draft.technical_evidence],
@@ -102,6 +104,34 @@ function draftReportGaps(handoff: ConversationReportHandoff | null): string[] {
   ]
     .filter(([, value]) => !value || !String(value).trim())
     .map(([label]) => String(label));
+}
+
+function findingReadinessScore(finding: Finding): number {
+  const present = (value: unknown) =>
+    Array.isArray(value) ? value.some(Boolean) : Boolean(String(value ?? "").trim());
+  const technicalEvidence =
+    finding.technical_evidence ||
+    finding.evidence
+      .map((item) => item.image_description || item.extracted_text || "")
+      .find((value) => value.trim()) ||
+    "";
+  const groups: Array<[number, unknown[]]> = [
+    [1.5, [finding.title, finding.description]],
+    [1, [finding.affected_scope]],
+    [2, [technicalEvidence]],
+    [1.5, [finding.reproduction_steps]],
+    [2, [finding.impact, finding.severity, finding.cvss_score, finding.cvss_vector]],
+    [2, [finding.matched_cves, finding.matched_techniques, finding.verdict]],
+  ];
+  return Number(
+    groups
+      .reduce(
+        (total, [maximum, values]) =>
+          total + maximum * (values.filter(present).length / values.length),
+        0,
+      )
+      .toFixed(1),
+  );
 }
 
 function ReportPage() {
@@ -120,6 +150,7 @@ function ReportPage() {
   const [selectedFindingIds, setSelectedFindingIds] = useState<string[]>([]);
   const [includeConversationDraft, setIncludeConversationDraft] = useState(false);
   const [generationAttempted, setGenerationAttempted] = useState(false);
+  const [acknowledgeIncomplete, setAcknowledgeIncomplete] = useState(false);
   const [findingSearch, setFindingSearch] = useState("");
   const [editingFinding, setEditingFinding] = useState<Finding | null | undefined>(undefined);
   const [findingTitle, setFindingTitle] = useState("");
@@ -176,8 +207,13 @@ function ReportPage() {
         engagement_title: engagementTitle.trim(),
         client_name: clientName.trim(),
         draft: includeConversationDraft ? conversationHandoff?.readiness.draft : undefined,
+        draft_finding_id: includeConversationDraft
+          ? (conversationHandoff?.finding_id ?? undefined)
+          : undefined,
         template_id: templateId === "builtin" ? undefined : templateId,
         sections: selectedSections,
+        force_export: forceEligible && acknowledgeIncomplete,
+        acknowledge_incomplete: acknowledgeIncomplete,
       });
       // Trigger download
       const url = URL.createObjectURL(blob);
@@ -325,12 +361,19 @@ function ReportPage() {
     .filter((finding) => findingReportGaps(finding).length > 0);
   const draftGaps = includeConversationDraft ? draftReportGaps(conversationHandoff) : [];
   const draftIncomplete = draftGaps.length > 0;
+  const hasIncompleteContent = incompleteSelected.length > 0 || draftIncomplete;
+  const incompleteScores = [
+    ...incompleteSelected.map(findingReadinessScore),
+    ...(draftIncomplete && conversationHandoff ? [conversationHandoff.readiness.score] : []),
+  ];
+  const minimumIncompleteScore = incompleteScores.length ? Math.min(...incompleteScores) : 10;
+  const forceEligible = hasIncompleteContent && minimumIncompleteScore >= 5;
   const missingRequirements = [
     !clientName.trim() ? "client or target" : null,
     !engagementTitle.trim() ? "engagement title" : null,
     reportItemCount === 0 ? "at least one selected finding" : null,
     selectedSections.length === 0 ? "at least one report section" : null,
-    incompleteSelected.length > 0 || draftIncomplete ? "complete report content" : null,
+    hasIncompleteContent && !forceEligible ? "complete report content" : null,
   ].filter((item): item is string => Boolean(item));
   const canGenerate = missingRequirements.length === 0;
 
@@ -437,14 +480,16 @@ function ReportPage() {
                   <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-sev-medium" />
                   <span>
                     <strong className="text-foreground">Still incomplete:</strong>{" "}
-                    {conversationHandoff.readiness.missing.join(", ")}. You can generate now or
-                    return to Analysis to strengthen these sections.
+                    {conversationHandoff.readiness.missing.join(", ")}. Strengthen these sections or
+                    use the force-export acknowledgement when the score is at least 5/10.
                   </span>
                 </div>
               )}
               {includeConversationDraft && draftGaps.length > 0 && (
                 <div className="mt-3 border border-sev-critical/30 bg-sev-critical/5 p-3 text-xs text-sev-critical">
-                  Client export is blocked until these fields are complete: {draftGaps.join(", ")}.
+                  {conversationHandoff.readiness.score < 5
+                    ? `Client export is blocked below 5/10 until these fields are complete: ${draftGaps.join(", ")}.`
+                    : `These fields are incomplete and will require an explicit acknowledgement: ${draftGaps.join(", ")}.`}
                 </div>
               )}
             </div>
@@ -658,23 +703,43 @@ function ReportPage() {
                 </span>
               </div>
             )}
+            {forceEligible && (
+              <div className="mb-3 border border-sev-medium/40 bg-sev-medium/10 p-3 text-xs">
+                <label className="flex items-start gap-2">
+                  <Checkbox
+                    checked={acknowledgeIncomplete}
+                    onCheckedChange={(checked) => setAcknowledgeIncomplete(checked === true)}
+                  />
+                  <span>
+                    I acknowledge this report has incomplete sections and am exporting as-is. The
+                    override will be recorded in the audit log.
+                  </span>
+                </label>
+              </div>
+            )}
             <div className="flex items-center justify-between gap-3">
               <span className="text-xs text-muted-foreground">
                 {canGenerate
                   ? `${reportItemCount} report item${reportItemCount === 1 ? "" : "s"} will be included.`
-                  : "Complete the highlighted requirements to generate the DOCX."}
+                  : forceEligible
+                    ? "AI assessed this draft as incomplete; an analyst override is available."
+                    : "Complete the highlighted requirements to generate the DOCX."}
               </span>
               <Button
                 className="min-w-40"
                 onClick={startGeneration}
-                disabled={reportMutation.isPending}
+                disabled={reportMutation.isPending || (forceEligible && !acknowledgeIncomplete)}
               >
                 {reportMutation.isPending ? (
                   <span className="h-4 w-4 mr-1.5 inline-block rounded-full border-2 border-white/30 border-t-white animate-spin" />
                 ) : (
                   <FileDown className="h-4 w-4 mr-1.5" />
                 )}
-                {reportMutation.isPending ? "Generating..." : `Generate ${format.toUpperCase()}`}
+                {reportMutation.isPending
+                  ? "Generating..."
+                  : forceEligible
+                    ? "Force export"
+                    : `Generate ${format.toUpperCase()}`}
               </Button>
             </div>
           </div>
