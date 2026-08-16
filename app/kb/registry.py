@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.kb.base import Availability, KBSource
 from app.kb.models import KBSourceState
 from app.kb.sources import (
+    FindingTemplatesSource,
     GhostwriterSource,
     InternalSource,
     MitreSource,
@@ -51,6 +52,7 @@ _SOURCES: list[KBSource] = [
     OwaspSource(),
     OwaspDocsSource(),
     GhostwriterSource(),
+    FindingTemplatesSource(),
     InternalSource(),
 ]
 

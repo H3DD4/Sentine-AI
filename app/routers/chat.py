@@ -16,6 +16,7 @@ from app.schemas import ChatRequest, ChatMessage, ValidationResult
 from app.services.retrieval import federated_search, multimodal_search
 from app.services.llm_client import AsyncLLMClient, configured_chat_models
 from app.services.validation import impact_narrative, validate_finding
+from app.services.chat_grounding import generate_conversational_response
 from app.config import settings
 from app.services.upload_processing import (
     cleanup_staged_evidence,
@@ -28,63 +29,17 @@ import json
 import io
 import logging
 import asyncio
+import time
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 log = logging.getLogger(__name__)
+SSE_PIPELINE_POLL_SECONDS = 1.0
+SSE_KEEPALIVE_SECONDS = 10.0
 
 
 def _validate_chat_model(model: str | None) -> None:
     if model and model not in configured_chat_models():
         raise HTTPException(400, "Selected model is not in the configured chat model chain")
-
-CHAT_SYSTEM = """You are RedTeam Assist, an internal AI assistant for Forvis Mazars red teamers.
-You help analysts validate penetration testing findings, correlate CVEs,
-map to MITRE ATT&CK, assign an evidence-supported risk rating, and prepare findings for reporting.
-Be concise, technical, and precise. Do not speculate beyond what evidence supports.
-Do not generate exploit code or attack payloads.
-
-Your role is finding analysis and report preparation, not defensive consulting:
-- Focus on the finding title, affected scope, technical description, evidence, reproduction,
-  likelihood, impact, CVSS rationale, severity, CVE correlation, and ATT&CK mapping.
-- Do not provide fixes, patches, upgrade advice, WAF rules, hardening guidance, remediation,
-  mitigation, or "immediate recommendations" unless the analyst explicitly asks for them.
-- Do not add a Recommendations, Remediation, or Next Steps section unless explicitly requested.
-- When more information is needed, ask only for evidence that would validate or accurately
-  rate the finding. Do not suggest additional post-exploitation commands when the supplied
-  evidence already establishes the claimed impact.
-- Separate what was observed, what is logically demonstrated by verified permissions or architecture,
-  what is conditional, and what is not established. CVSS is technical severity, not business risk.
-- Give one exact CVSS score only when every material metric is established by current-target evidence.
-  When unknown permissions, scope, controls, or downstream effects could change metrics, present a
-  clearly labelled scenario range: an evidence-established lower scenario and a conditional upper
-  scenario with every assumption stated. Never present the upper scenario as the finding's score.
-- Grade every CVE, CWE, OWASP, and ATT&CK mapping as direct, supporting, conditional, rejected, or
-  unsupported. A similar CVE is not a matched CVE. ATT&CK credential-use techniques are conditional
-  when credentials were obtained but not used. Cite the exact retrieved source entry for any supported
-  identifier and omit identifiers that were not returned by the authoritative source this turn.
-- Connect demonstrated capability to the target's actual asset, data, identity, business process,
-  customer, financial, regulatory, operational, or safety context only when that context is supplied.
-- If target context is incomplete, give the strongest bounded technical conclusion first. Then ask
-  one compact batch of no more than three questions, selected only because the answers could change
-  the business priority or strongest defensible impact. Combine related details, offer short answer
-  choices when useful, and never repeat a question the analyst already answered.
-
-Knowledge base context is supplied in a [KB CONTEXT] section. Each entry is labelled with the
-source it came from. Ground your response in those entries and cite specific CVE or technique IDs.
-
-The [DATA COVERAGE] line states which knowledge sources were searched for this turn and which
-were unavailable. Honour it:
-- Do not claim a source supports you unless entries from it appear in the context.
-- Do not emit a CVE or ATT&CK identifier unless that exact identifier appears in a retrieved
-  NVD or MITRE context entry. If the authoritative source did not contribute, state that no
-  source-backed identifier mapping is available for this turn.
-- Treat Ghostwriter as historical methodology and precedent, never as proof that historical
-  impact also occurred in the current test. Observed evidence controls the verdict and impact.
-- If a source was unavailable, say so plainly when the question depended on it, rather than
-  filling the gap from your own training data and presenting it as retrieved fact.
-- If no context was retrieved at all, answer from general knowledge but state clearly that the
-  answer is not grounded in the knowledge base."""
-
 
 def _needs_retrieval(query: str) -> bool:
     """Avoid attaching arbitrary CVEs to greetings and other social-only turns."""
@@ -159,45 +114,6 @@ def _retrieval_inputs(messages: list[ChatMessage]) -> tuple[str, list[str]]:
     # usually a different sub-topic and add noise.
     context = ["\n".join(prior[-3:])] if prior else []
     return latest, context
-
-
-def _build_messages_with_context(
-    messages: list[ChatMessage], outcome: SearchOutcome
-) -> list[dict]:
-    """Inject KB context as a final system section, NOT appended to user text."""
-    out = _bounded_provider_messages(messages)
-
-    lines = []
-    for hit in outcome.hits:
-        payload = hit.payload or {}
-        cvss = f" (CVSS {payload['cvss_v3']})" if payload.get("cvss_v3") else ""
-        # The source label rides on every line: without it the model cannot
-        # tell a public CVE record from a colleague's prior engagement finding,
-        # and neither can the analyst reading the citation afterwards.
-        limit = 1200 if hit.source_key == "ghostwriter" else 600
-        lines.append(f"• [{hit.source_label}] {hit.title}{cvss}: {hit.text[:limit]}")
-
-    # The coverage line is always injected, including when nothing was found —
-    # that is precisely the case where the model would otherwise answer from
-    # memory and the analyst would have no way to tell.
-    context_block = "[DATA COVERAGE] " + outcome.provenance_line()
-    if lines:
-        context_block += "\n\n[KB CONTEXT — use this to inform your response]\n" + "\n".join(lines)
-    else:
-        context_block += "\n\n[KB CONTEXT] No knowledge base entries matched this query."
-
-    user_idx = next(
-        (i for i in reversed(range(len(out))) if out[i]["role"] == "user"),
-        None,
-    )
-    if user_idx is not None:
-        out.insert(user_idx, {"role": "user", "content": context_block})
-        out.insert(user_idx + 1, {
-            "role": "assistant",
-            "content": "Understood. I'll ground my analysis in that context and respect the stated coverage.",
-        })
-
-    return out
 
 
 def _bounded_provider_messages(
@@ -512,15 +428,17 @@ async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
     social_reply = _social_reply(query)
     if social_reply:
         return {"response": social_reply, **_provenance_payload(outcome)}
-    messages = _build_messages_with_context(req.messages, outcome)
+    messages = _bounded_provider_messages(req.messages)
 
     client = AsyncLLMClient()
-    response = await _generate_complete_response(
-        client, messages, system=CHAT_SYSTEM, model=req.model
+    response, grounding_issues = await generate_conversational_response(
+        client, messages, outcome, model=req.model
     )
     return {
         "response": response,
         "generation": client.last_generation,
+        "grounding_issues": grounding_issues,
+        "corrected": False,
         **_provenance_payload(outcome),
     }
 
@@ -600,16 +518,25 @@ async def chat_with_evidence(
     except Exception:
         cleanup_staged_evidence(parsed_files)
         raise
-    llm_messages = _build_messages_with_context(parsed_messages, outcome)
+    llm_messages = _bounded_provider_messages(parsed_messages)
 
     client = AsyncLLMClient()
     try:
-        response = await _generate_complete_response(client, llm_messages, system=CHAT_SYSTEM)
+        response, grounding_issues = await generate_conversational_response(
+            client,
+            llm_messages,
+            outcome,
+            model=None,
+            text_evidence_count=len(evidence_texts),
+            image_evidence_count=len(image_descriptions),
+        )
     finally:
         cleanup_staged_evidence(parsed_files)
     return {
         "response": response,
         "generation": client.last_generation,
+        "grounding_issues": grounding_issues,
+        "corrected": False,
         **_provenance_payload(outcome),
         "processing": processing,
     }
@@ -638,9 +565,11 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
     social_reply = _social_reply(query)
 
     async def event_generator():
+        yield f"data: {json.dumps({'stage': {'key': 'retrieve', 'label': 'Searching knowledge', 'status': 'active', 'detail': 'Checking approved local sources'}})}\n\n"
         outcome = await _conversation_outcome(query, prior_turns, session)
-        messages = _build_messages_with_context(req.messages, outcome)
+        messages = _bounded_provider_messages(req.messages)
         yield f"data: {json.dumps(_provenance_payload(outcome))}\n\n"
+        yield f"data: {json.dumps({'stage': {'key': 'retrieve', 'label': 'Searching knowledge', 'status': 'complete', 'detail': outcome.provenance_line()}})}\n\n"
 
         if social_reply:
             yield f"data: {json.dumps({'token': social_reply})}\n\n"
@@ -648,45 +577,56 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
             return
 
         client = AsyncLLMClient()
-        generation_signature = None
-        completed = ""
         try:
-            round_messages = messages
-            for continuation in range(settings.CHAT_MAX_CONTINUATIONS + 1):
-                async for chunk in client.generate_stream(
-                    messages=round_messages,
-                    system=CHAT_SYSTEM,
-                    max_tokens=settings.CHAT_MAX_TOKENS,
-                    model=req.model,
-                ):
-                    completed += chunk
-                    current_signature = json.dumps(client.last_generation, sort_keys=True)
-                    if client.last_generation and current_signature != generation_signature:
-                        yield f"data: {json.dumps({'generation': client.last_generation})}\n\n"
-                        generation_signature = current_signature
-                    yield f"data: {json.dumps({'token': chunk})}\n\n"
-                current_signature = json.dumps(client.last_generation, sort_keys=True)
-                if client.last_generation and current_signature != generation_signature:
-                    yield f"data: {json.dumps({'generation': client.last_generation})}\n\n"
-                    generation_signature = current_signature
-                if not _was_length_limited(client.last_finish_reason):
-                    break
-                if continuation == settings.CHAT_MAX_CONTINUATIONS:
-                    break
-                round_messages = [
-                    *messages,
-                    {"role": "assistant", "content": completed},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Continue exactly where the response stopped. Do not repeat any heading, "
-                            "table row, sentence, or source list already written. Finish all remaining "
-                            "requested sections."
-                        ),
-                    },
-                ]
+            stages: asyncio.Queue[dict] = asyncio.Queue()
+
+            async def emit_stage(key: str, label: str, status: str, detail: str) -> None:
+                await stages.put({
+                    "key": key,
+                    "label": label,
+                    "status": status,
+                    "detail": detail,
+                })
+
+            generation_task = asyncio.create_task(generate_conversational_response(
+                client, messages, outcome, model=req.model, stage=emit_stage
+            ))
+            last_keepalive = time.monotonic()
+            try:
+                while not generation_task.done() or not stages.empty():
+                    try:
+                        stage_data = await asyncio.wait_for(
+                            stages.get(), timeout=SSE_PIPELINE_POLL_SECONDS
+                        )
+                        yield f"data: {json.dumps({'stage': stage_data})}\n\n"
+                    except asyncio.TimeoutError:
+                        now = time.monotonic()
+                        if now - last_keepalive >= SSE_KEEPALIVE_SECONDS:
+                            # SSE comments are ignored by the client parser but
+                            # keep browsers and reverse proxies from declaring a
+                            # private validation/correction call stalled.
+                            yield ": grounding pipeline active\n\n"
+                            last_keepalive = now
+                completed, grounding_issues = await generation_task
+            finally:
+                if not generation_task.done():
+                    generation_task.cancel()
+                    try:
+                        await generation_task
+                    except asyncio.CancelledError:
+                        pass
+            if client.last_generation:
+                yield f"data: {json.dumps({'generation': client.last_generation})}\n\n"
+            if grounding_issues:
+                yield f"data: {json.dumps({'grounding_issues': grounding_issues})}\n\n"
+            # Buffering is deliberate: no unaudited token is exposed and then
+            # impossible to retract. Moderate chunks retain incremental UI rendering.
+            for start in range(0, len(completed), 240):
+                yield f"data: {json.dumps({'token': completed[start:start + 240]})}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            log.exception("Grounded streaming chat failed after retrieval")
+            yield f"data: {json.dumps({'stage': {'key': 'pipeline', 'label': 'Grounding failed', 'status': 'error', 'detail': type(exc).__name__}})}\n\n"
+            yield f"data: {json.dumps({'error': 'Grounded response generation failed. The server logged the underlying ' + type(exc).__name__ + '.'})}\n\n"
         finally:
             yield f"data: {json.dumps({'done': True})}\n\n"
 

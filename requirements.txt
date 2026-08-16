@@ -8,6 +8,7 @@ alembic>=1.13.0
 qdrant-client>=1.9.0
 sentence-transformers>=3.0.0
 fastembed>=0.7.0
+cvss==3.6
 anthropic>=0.27.0
 openai>=1.30.0
 google-genai>=0.3.0

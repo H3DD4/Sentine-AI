@@ -1,10 +1,11 @@
-"""Populate public security knowledge sources and their Qdrant indexes.
+"""Populate security knowledge sources and their Qdrant indexes.
 
 Examples:
     python -m scripts.sync_security_kb
     python -m scripts.sync_security_kb --source mitre
     python -m scripts.sync_security_kb --source owasp  # all official releases since 2021
     python -m scripts.sync_security_kb --source owasp-docs
+    python -m scripts.sync_security_kb --source finding-templates
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from app.db import AsyncSessionLocal
 from app.ingestion.mitre_sync import sync_mitre
 from app.ingestion.owasp_sync import sync_owasp_top10
 from app.ingestion.owasp_docs_sync import sync_owasp_documents
+from app.ingestion.finding_templates_sync import sync_finding_templates
 from app.kb.indexer import ensure_all_collections
 from app.kb.models import OwaspDocument, OwaspTop10Entry
 from app.kb.registry import all_sources, get_health
@@ -40,10 +42,13 @@ async def main(source: str) -> None:
         if source in ("all", "mitre"):
             print("Syncing MITRE ATT&CK...")
             print(await sync_mitre(session))
+        if source in ("all", "finding-templates"):
+            print("Syncing firm finding templates...")
+            print(await sync_finding_templates(session))
 
         health = await get_health(session, qdrant, force=True)
         print("\nSource health:")
-        for key in ("owasp", "owasp_docs", "mitre"):
+        for key in health:
             state = health[key]
             print(
                 f"  {key}: {state.availability.value}, "
@@ -77,7 +82,9 @@ async def main(source: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--source", choices=("all", "owasp", "owasp-docs", "mitre"), default="all"
+        "--source",
+        choices=("all", "owasp", "owasp-docs", "mitre", "finding-templates"),
+        default="all",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")

@@ -27,6 +27,7 @@ import type {
   Provenance,
   ReportReadiness,
   SourcesResponse,
+  StreamStage,
   ValidationResponse,
   AppSettings,
 } from "@/lib/api";
@@ -83,7 +84,14 @@ type Msg = {
    */
   provenance?: Provenance;
   generation?: GenerationInfo;
+  stages?: StreamStage[];
 };
+
+function upsertStage(stages: StreamStage[] = [], next: StreamStage): StreamStage[] {
+  const index = stages.findIndex((stage) => stage.key === next.key);
+  if (index === -1) return [...stages, next];
+  return stages.map((stage, current) => (current === index ? next : stage));
+}
 
 function modelLabel(model: string): string {
   const name =
@@ -185,7 +193,7 @@ function loadStoredMessages(): Msg[] {
     if (!Array.isArray(parsed)) return [];
     // A message persisted mid-stream would restore stuck in the "streaming"
     // state, with a cursor that never resolves and no request behind it.
-    return parsed.map((m: Msg) => ({ ...m, streaming: false }));
+    return parsed.map((m: Msg) => ({ ...m, streaming: false, stages: undefined }));
   } catch {
     // Corrupt or unreadable storage must never take the page down — an empty
     // transcript is a recoverable state, a crashed route is not.
@@ -283,6 +291,39 @@ function MarkdownText({ text }: { text: string }) {
         );
       })}
     </>
+  );
+}
+
+function PipelineProgress({ stages }: { stages: StreamStage[] }) {
+  const active = stages.find((stage) => stage.status === "active");
+  return (
+    <div className="mb-3 border-b border-border/70 pb-3" role="status" aria-live="polite">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+        {stages.map((stage, index) => (
+          <div key={stage.key} className="flex items-center gap-1.5 text-[11px]">
+            {stage.status === "complete" ? (
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
+            ) : stage.status === "error" ? (
+              <AlertCircle className="h-3.5 w-3.5 text-destructive" />
+            ) : stage.status === "active" ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-brand-cyan" />
+            ) : (
+              <span className="h-2 w-2 rounded-full border border-muted-foreground/50" />
+            )}
+            <span
+              className={cn(
+                "font-medium",
+                stage.status === "active" ? "text-foreground" : "text-muted-foreground",
+              )}
+            >
+              {stage.label}
+            </span>
+            {index < stages.length - 1 && <span className="ml-0.5 text-border">/</span>}
+          </div>
+        ))}
+      </div>
+      {active?.detail && <p className="mt-1.5 text-xs text-muted-foreground">{active.detail}</p>}
+    </div>
   );
 }
 
@@ -875,7 +916,9 @@ function ChatPage() {
           setWaitingElapsed(0);
           setMessages((prev) => {
             if (!accumulated.trim()) return prev.filter((m) => m.id !== aiMsgId);
-            return prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m));
+            return prev.map((m) =>
+              m.id === aiMsgId ? { ...m, streaming: false, stages: undefined } : m,
+            );
           });
           setIsStreaming(false);
           streamInFlightRef.current = false;
@@ -904,7 +947,9 @@ function ChatPage() {
           setWaitingElapsed(0);
           setMessages((prev) => {
             if (!accumulated.trim()) return prev.filter((m) => m.id !== aiMsgId);
-            return prev.map((m) => (m.id === aiMsgId ? { ...m, streaming: false } : m));
+            return prev.map((m) =>
+              m.id === aiMsgId ? { ...m, streaming: false, stages: undefined } : m,
+            );
           });
           setIsStreaming(false);
           streamInFlightRef.current = false;
@@ -914,6 +959,15 @@ function ChatPage() {
           setMessages((prev) => prev.map((m) => (m.id === aiMsgId ? { ...m, generation } : m)));
         },
         selectedModel === "auto" ? undefined : selectedModel,
+        (stage) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === aiMsgId ? { ...m, stages: upsertStage(m.stages, stage) } : m,
+            ),
+          );
+          if (!firstTokenReceived) setIsWaitingForFirstToken(true);
+          followStream();
+        },
       );
 
       stopStreamRef.current = stop;
@@ -1198,8 +1252,11 @@ function ChatPage() {
                         m.from === "ai" ? "bg-muted/50" : "bg-brand-navy text-white",
                       )}
                     >
+                      {m.from === "ai" && m.streaming && m.stages && m.stages.length > 0 && (
+                        <PipelineProgress stages={m.stages} />
+                      )}
                       {m.from === "ai" ? (
-                        isWaitingForFirstToken && m.streaming && !m.text ? (
+                        isWaitingForFirstToken && m.streaming && !m.text && !m.stages?.length ? (
                           <div className="flex items-center gap-2 text-sm text-muted-foreground">
                             <Loader2 className="h-4 w-4 shrink-0 animate-spin text-brand-cyan" />
                             <span>

@@ -145,6 +145,250 @@ class ImpactAssessmentTests(unittest.TestCase):
         self.assertEqual(data["mappings"][0]["applicability"], "direct")
         self.assertEqual(data["matched_techniques"], ["T1552.005"])
 
+    def test_cvss_score_and_severity_are_calculated_not_trusted(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [],
+            "impact_assessment": {
+                "cvss": {
+                    "status": "exact",
+                    "version": "3.1",
+                    "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+                    "score": 0.1,
+                    "severity": "low",
+                }
+            },
+        }
+
+        _normalize_assessment(data, SearchOutcome())
+
+        self.assertEqual(data["impact_assessment"]["cvss"]["score"], 6.5)
+        self.assertEqual(data["impact_assessment"]["cvss"]["severity"], "medium")
+
+    def test_observed_claim_without_retrieved_evidence_is_downgraded(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [],
+            "impact_assessment": {
+                "claims": [
+                    {
+                        "level": "observed",
+                        "statement": "The target exposed credentials.",
+                        "evidence_basis": "The model believes this happened.",
+                        "evidence_ids": ["FAKE99"],
+                    }
+                ]
+            },
+        }
+
+        _normalize_assessment(data, SearchOutcome(), text_evidence_count=1)
+
+        claim = data["impact_assessment"]["claims"][0]
+        self.assertEqual(claim["level"], "conditional")
+        self.assertEqual(claim["evidence_ids"], [])
+
+    def test_observed_claim_citing_only_kb_precedent_is_downgraded(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [],
+            "impact_assessment": {
+                "claims": [
+                    {
+                        "level": "observed",
+                        "statement": "The target leaks IAM credentials.",
+                        "evidence_basis": "A prior finding describes it.",
+                        "evidence_ids": ["KB1"],
+                    }
+                ]
+            },
+        }
+        outcome = SearchOutcome(hits=[
+            RetrievalHit(
+                source_key="ghostwriter",
+                source_label="Ghostwriter",
+                doc_id="prior-ssrf",
+                title="Prior SSRF finding",
+                text="A previous target leaked credentials.",
+                score=1.0,
+            )
+        ])
+
+        _normalize_assessment(data, outcome)
+
+        self.assertEqual(data["impact_assessment"]["claims"][0]["level"], "conditional")
+        self.assertTrue(data["grounding_issues"])
+
+    def test_logically_demonstrated_claim_citing_only_kb_is_downgraded(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [],
+            "impact_assessment": {
+                "claims": [{
+                    "level": "logically_demonstrated",
+                    "statement": "The target role can read production data.",
+                    "evidence_basis": "A prior finding had broad permissions.",
+                    "evidence_ids": ["KB1"],
+                }]
+            },
+        }
+        outcome = SearchOutcome(hits=[
+            RetrievalHit(
+                source_key="ghostwriter",
+                source_label="Ghostwriter",
+                doc_id="prior-role",
+                title="Prior cloud finding",
+                text="A different target had broad role permissions.",
+                score=1.0,
+            )
+        ])
+
+        _normalize_assessment(data, outcome)
+
+        self.assertEqual(data["impact_assessment"]["claims"][0]["level"], "conditional")
+        self.assertTrue(data["grounding_issues"])
+
+    def test_cross_source_cve_mapping_is_rejected(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [
+                {
+                    "mapping_type": "cve",
+                    "identifier": "CVE-2024-12345",
+                    "applicability": "direct",
+                    "rationale": "Model attached a CVE to an OWASP document.",
+                    "source": "owasp_docs",
+                    "source_doc_id": "CVE-2024-12345",
+                }
+            ],
+        }
+        outcome = SearchOutcome(hits=[
+            RetrievalHit(
+                source_key="owasp_docs",
+                source_label="OWASP Official Guides",
+                doc_id="CVE-2024-12345",
+                title="Unrelated guide",
+                text="Guide text.",
+                score=1.0,
+            )
+        ])
+
+        _normalize_assessment(data, outcome)
+
+        self.assertEqual(data["mappings"][0]["applicability"], "unsupported")
+        self.assertEqual(data["matched_cves"], [])
+
+    def test_template_code_requires_matching_template_payload(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [
+                {
+                    "mapping_type": "template",
+                    "identifier": "ASIA_V_013",
+                    "applicability": "supporting",
+                    "rationale": "Approved template language.",
+                    "source": "finding_templates",
+                    "source_doc_id": "row-hash-1",
+                }
+            ],
+        }
+        outcome = SearchOutcome(hits=[
+            RetrievalHit(
+                source_key="finding_templates",
+                source_label="Internal finding templates",
+                doc_id="row-hash-1",
+                title="Template",
+                text="Template text.",
+                score=1.0,
+                payload={"template_code": "ASIA_V_013"},
+            )
+        ])
+
+        _normalize_assessment(data, outcome)
+
+        self.assertEqual(data["mappings"][0]["applicability"], "supporting")
+
+    def test_malformed_cvss_becomes_pending_evidence(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [],
+            "impact_assessment": {
+                "cvss": {
+                    "status": "exact",
+                    "version": "3.1",
+                    "vector": "CVSS:3.1/AV:INVALID",
+                    "score": 9.9,
+                    "severity": "critical",
+                }
+            },
+        }
+
+        _normalize_assessment(data, SearchOutcome())
+
+        self.assertEqual(data["impact_assessment"]["cvss"]["status"], "pending_evidence")
+
+    def test_mixed_cvss_range_versions_become_pending_evidence(self):
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [],
+            "impact_assessment": {
+                "cvss": {
+                    "status": "range",
+                    "lower_bound": {
+                        "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+                        "score": 1.0,
+                    },
+                    "upper_bound": {
+                        "vector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+                        "score": 9.0,
+                    },
+                }
+            },
+        }
+
+        _normalize_assessment(data, SearchOutcome())
+
+        self.assertEqual(data["impact_assessment"]["cvss"]["status"], "pending_evidence")
+
+    def test_contradictory_mapping_decisions_are_both_rejected(self):
+        base = {
+            "mapping_type": "attack",
+            "identifier": "T1552.005",
+            "source": "mitre",
+            "source_doc_id": "T1552.005",
+            "rationale": "Decision",
+        }
+        data = {
+            "matched_cves": [],
+            "matched_techniques": [],
+            "mappings": [
+                {**base, "applicability": "direct"},
+                {**base, "applicability": "rejected"},
+            ],
+        }
+        outcome = SearchOutcome(hits=[
+            RetrievalHit(
+                source_key="mitre",
+                source_label="MITRE ATT&CK",
+                doc_id="T1552.005",
+                title="Cloud Instance Metadata API",
+                text="Technique text.",
+                score=1.0,
+            )
+        ])
+
+        _normalize_assessment(data, outcome)
+
+        self.assertTrue(all(m["applicability"] == "unsupported" for m in data["mappings"]))
+        self.assertEqual(data["matched_techniques"], [])
+
     def test_report_narrative_separates_conditional_and_excluded_impact(self):
         result = ValidationResult(
             verdict="confirmed",

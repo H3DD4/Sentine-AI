@@ -22,6 +22,8 @@ import asyncio
 import logging
 import re
 
+from cvss import CVSS3, CVSS4
+from cvss.exceptions import CVSS3MalformedError, CVSS4MalformedError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.kb.base import SearchOutcome
@@ -39,14 +41,25 @@ KB_CONTEXT_CHARS = 16_000
 
 _CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _ATTACK_ID = re.compile(r"^T\d{4}(?:\.\d{3})?$", re.IGNORECASE)
+_CWE_ID = re.compile(r"^CWE-\d+$", re.IGNORECASE)
+_OWASP_ID = re.compile(r"^A(?:0[1-9]|10):20\d{2}$", re.IGNORECASE)
+_TEMPLATE_ID = re.compile(r"^(?:(?:TII|TIS|ASIA)_)?(?:BP|V)_\d{3}$", re.IGNORECASE)
+
+_MAPPING_SOURCES = {
+    "cve": {"nvd"},
+    "attack": {"mitre"},
+    "owasp": {"owasp", "owasp_docs"},
+    "cwe": {"nvd", "owasp", "owasp_docs"},
+    "template": {"finding_templates"},
+}
 
 VALIDATION_SYSTEM = """You are a senior red team analyst and security risk assessor at Forvis Mazars.
 Your job is to validate whether a reported penetration testing finding is a confirmed vulnerability,
 a likely issue, insufficient to confirm, or a false positive, then assess its target-specific impact.
 
 You are given context retrieved from a knowledge base of CVEs, MITRE ATT&CK techniques, prior
-engagement findings, and internal documentation. Each context entry is labelled with the source it
-came from. Ground your analysis in that context.
+engagement findings, internal finding templates, and internal documentation. Each context entry is
+labelled with the source it came from. Ground your analysis in that context.
 
 You MUST respond ONLY with a valid JSON object matching this exact schema:
 {
@@ -56,7 +69,7 @@ You MUST respond ONLY with a valid JSON object matching this exact schema:
   "matched_cves": ["CVE-YYYY-NNNNN", ...],
   "matched_techniques": ["T1234", "T1234.001", ...],
   "mappings": [{
-    "mapping_type": "cve" | "cwe" | "owasp" | "attack",
+    "mapping_type": "cve" | "cwe" | "owasp" | "attack" | "template",
     "identifier": "<exact identifier>",
     "name": "<canonical name if present in context>",
     "applicability": "direct" | "supporting" | "conditional" | "rejected" | "unsupported",
@@ -91,6 +104,7 @@ You MUST respond ONLY with a valid JSON object matching this exact schema:
       "level": "observed" | "logically_demonstrated" | "conditional",
       "statement": "<one material impact claim>",
       "evidence_basis": "<specific submitted evidence, verified permission, architecture fact, or owner statement>",
+      "evidence_ids": ["<exact EVIDENCE ID such as FINDING1, KB1, TEXT1, or IMAGE1>"],
       "conditions": ["<unverified prerequisites; empty for observed claims>"]
     }],
     "excluded_claims": ["<material consequence explicitly not established>"],
@@ -114,6 +128,8 @@ Rules:
 - The DATA COVERAGE block states which knowledge sources were searched. If a source was
   unavailable, treat its subject area as unverified: lower your confidence and name the gap in
   "missing_evidence" rather than answering from your own knowledge as if it were retrieved.
+- Treat internal finding templates as approved example language and precedent, not as evidence
+  that the current target is vulnerable. Current-target evidence controls verdict, impact, and CVSS.
 - If no context was retrieved at all, the only defensible verdicts are "insufficient" or
   "false_positive", and "reasoning" must say the finding could not be checked against the KB.
 - Be specific in reasoning — name the exact evidence that led to each conclusion.
@@ -138,6 +154,10 @@ Rules:
 - "logically_demonstrated" requires a verified permission, architecture, code, data-flow, or owner fact
   that completes the path even though the final business action was intentionally not executed.
 - "conditional" must name every material unverified condition. Never phrase it as established impact.
+- Every observed or logically_demonstrated claim must cite at least one exact EVIDENCE ID supplied in
+  the prompt. Conditional claims should cite the evidence that supports their established premise.
+- KB evidence can support classifications, background, and recommendations, but cannot by itself prove
+  an observed fact about the current target. Observed claims must cite FINDING1, TEXTn, or IMAGEn.
 - Put dramatic but unsupported outcomes such as full account takeover, all-customer data exposure,
   regulatory fines, ransomware, or business shutdown in excluded_claims when they are relevant enough
   that a reader might otherwise infer them.
@@ -174,7 +194,7 @@ def build_context_block(outcome: SearchOutcome) -> str:
     blocks = []
     for i, hit in enumerate(outcome.hits, 1):
         payload = hit.payload or {}
-        lines = [f"[{i}] SOURCE: {hit.source_label} | ID: {hit.doc_id}"]
+        lines = [f"[KB{i}] SOURCE: {hit.source_label} | ID: {hit.doc_id}"]
         if hit.title and hit.title != hit.doc_id:
             lines.append(f"Title: {hit.title}")
 
@@ -237,18 +257,153 @@ def impact_narrative(result: ValidationResult) -> str:
     return "\n\n".join(sections)
 
 
-def _normalize_assessment(data: dict, outcome: SearchOutcome) -> None:
+def _calculated_cvss(vector: str) -> tuple[str, float, str]:
+    """Parse a CVSS vector and return its canonical vector, score, and severity."""
+    vector = str(vector or "").strip()
+    calculator = CVSS4(vector) if vector.startswith("CVSS:4.0/") else CVSS3(vector)
+    return calculator.clean_vector(), float(calculator.scores()[0]), calculator.severities()[0].lower()
+
+
+def _normalize_cvss(assessment: dict) -> bool:
+    """Make static CVSS formulas authoritative over generated numbers and labels."""
+    cvss = assessment.get("cvss")
+    if not isinstance(cvss, dict):
+        return False
+
+    status = cvss.get("status")
+    if status not in {"exact", "range", "pending_evidence", "not_applicable"}:
+        status = "invalid"
+    try:
+        if status == "invalid":
+            raise ValueError("unknown CVSS status")
+        if status == "exact":
+            scenarios = [cvss]
+        elif status == "range":
+            lower = cvss.get("lower_bound")
+            upper = cvss.get("upper_bound")
+            if not isinstance(lower, dict) or not isinstance(upper, dict):
+                raise ValueError("range requires two scenarios")
+            scenarios = [lower, upper]
+        else:
+            scenarios = []
+        for scenario in scenarios:
+            vector, score, severity = _calculated_cvss(scenario.get("vector", ""))
+            scenario["vector"] = vector
+            scenario["score"] = score
+            scenario["severity"] = severity
+        if status == "exact":
+            cvss["version"] = "4.0" if cvss["vector"].startswith("CVSS:4.0/") else "3.1"
+        elif status == "range":
+            lower = cvss.get("lower_bound") or {}
+            upper = cvss.get("upper_bound") or {}
+            versions = {
+                "4.0" if item["vector"].startswith("CVSS:4.0/") else "3.1"
+                for item in (lower, upper)
+            }
+            if len(versions) != 1:
+                raise ValueError("range scenarios use different CVSS versions")
+            cvss["version"] = versions.pop()
+            if float(lower.get("score", 0)) > float(upper.get("score", 0)):
+                raise ValueError("calculated lower bound exceeds upper bound")
+        return True
+    except (CVSS3MalformedError, CVSS4MalformedError, KeyError, TypeError, ValueError):
+        assessment["cvss"] = {
+            "status": "pending_evidence",
+            "version": "",
+            "vector": "",
+            "score": None,
+            "severity": "",
+            "rationale": "The proposed CVSS vector failed deterministic validation.",
+            "lower_bound": None,
+            "upper_bound": None,
+            "unresolved_metrics": ["A complete valid CVSS vector is required."],
+        }
+        return False
+
+
+def _normalize_assessment(
+    data: dict,
+    outcome: SearchOutcome,
+    *,
+    text_evidence_count: int = 0,
+    image_evidence_count: int = 0,
+) -> None:
     """Apply provenance and compatibility guards after generation, before persistence."""
+    grounding_issues = list(data.get("grounding_issues") or [])
     assessment = data.get("impact_assessment")
     if isinstance(assessment, dict):
         questions = assessment.get("clarification_questions")
         if isinstance(questions, list):
             assessment["clarification_questions"] = questions[:3]
+        if not _normalize_cvss(assessment):
+            grounding_issues.append("The proposed CVSS assessment failed deterministic validation.")
 
-    retrieved = {
-        (hit.source_key.lower(), str(hit.doc_id).upper())
-        for hit in outcome.hits
-    }
+        allowed_evidence = {
+            "FINDING1",
+            *(f"KB{i}" for i in range(1, len(outcome.hits) + 1)),
+            *(f"TEXT{i}" for i in range(1, text_evidence_count + 1)),
+            *(f"IMAGE{i}" for i in range(1, image_evidence_count + 1)),
+        }
+        normalized_claims = []
+        for raw_claim in assessment.get("claims") or []:
+            if not isinstance(raw_claim, dict):
+                continue
+            claim = dict(raw_claim)
+            claim["evidence_ids"] = list(dict.fromkeys(
+                str(item).strip().upper()
+                for item in claim.get("evidence_ids") or []
+                if str(item).strip().upper() in allowed_evidence
+            ))
+            level = claim.get("level")
+            current_target_ids = [
+                evidence_id for evidence_id in claim["evidence_ids"]
+                if evidence_id == "FINDING1"
+                or evidence_id.startswith("TEXT")
+                or evidence_id.startswith("IMAGE")
+            ]
+            invalid_direct_claim = (
+                level in {"observed", "logically_demonstrated"}
+                and not current_target_ids
+            )
+            if invalid_direct_claim:
+                claim["level"] = "conditional"
+                conditions = list(claim.get("conditions") or [])
+                conditions.append("No valid current-target evidence reference supports this claim level.")
+                claim["conditions"] = list(dict.fromkeys(conditions))
+                grounding_issues.append(
+                    f"Claim downgraded because its evidence does not support level={level}: "
+                    f"{str(claim.get('statement') or '')[:160]}"
+                )
+            normalized_claims.append(claim)
+        assessment["claims"] = normalized_claims
+
+    retrieved: dict[tuple[str, str], set[str]] = {}
+    for hit in outcome.hits:
+        source_key = hit.source_key.lower()
+        identifiers = {str(hit.doc_id).strip().upper()}
+        payload = hit.payload or {}
+        for key in (
+            "template_code", "cve_id", "technique_id", "attack_id", "cwe", "cwe_ids"
+        ):
+            value = payload.get(key)
+            if value:
+                if isinstance(value, list):
+                    identifiers.update(str(item).strip().upper() for item in value)
+                else:
+                    identifiers.add(str(value).strip().upper())
+        retrieved.setdefault((source_key, str(hit.doc_id).strip().upper()), set()).update(identifiers)
+
+    def mapping_identity_valid(mapping: dict, mapping_type: str, identifier: str) -> bool:
+        source = str(mapping.get("source") or "").strip().lower()
+        source_doc_id = str(mapping.get("source_doc_id") or "").strip().upper()
+        if source not in _MAPPING_SOURCES.get(mapping_type, set()):
+            return False
+        key = (source, source_doc_id)
+        if key not in retrieved:
+            return False
+        aliases = retrieved[key]
+        return identifier in aliases or source_doc_id == identifier
+
     normalized_mappings = []
     for raw in data.get("mappings") or []:
         if not isinstance(raw, dict):
@@ -258,35 +413,98 @@ def _normalize_assessment(data: dict, outcome: SearchOutcome) -> None:
         source = str(mapping.get("source") or "").strip().lower()
         source_doc_id = str(mapping.get("source_doc_id") or "").strip().upper()
         applicability = str(mapping.get("applicability") or "unsupported")
+        mapping_type = str(mapping.get("mapping_type") or "").strip().lower()
+        if mapping_type not in _MAPPING_SOURCES:
+            grounding_issues.append(
+                f"Unknown mapping type rejected: {mapping_type or '<empty>'}"
+            )
+            continue
+        if applicability not in {
+            "direct", "supporting", "conditional", "rejected", "unsupported"
+        }:
+            applicability = "unsupported"
+            grounding_issues.append(
+                f"Unknown mapping applicability rejected for {mapping_type} {identifier}: "
+                f"{str(mapping.get('applicability') or '<empty>')}"
+            )
+        mapping["applicability"] = applicability
         mapping["identifier"] = identifier
+        mapping["mapping_type"] = mapping_type
+        pattern = {
+            "cve": _CVE_ID,
+            "cwe": _CWE_ID,
+            "owasp": _OWASP_ID,
+            "attack": _ATTACK_ID,
+        "template": _TEMPLATE_ID,
+        }.get(mapping_type)
+        syntax_valid = bool(pattern and pattern.fullmatch(identifier))
         if applicability in {"direct", "supporting", "conditional"}:
-            if not source or not source_doc_id or (source, source_doc_id) not in retrieved:
+            if (
+                not syntax_valid
+                or not source
+                or not source_doc_id
+                or not mapping_identity_valid(mapping, mapping_type, identifier)
+            ):
                 mapping["applicability"] = "unsupported"
                 mapping["source"] = ""
                 mapping["source_doc_id"] = ""
                 mapping["rationale"] = (
                     str(mapping.get("rationale") or "")
-                    + " No exact retrieved authoritative entry backed this mapping."
+                    + " No exact retrieved authoritative entry of the correct source and identifier type backed this mapping."
                 ).strip()
+                grounding_issues.append(
+                    f"Unsupported {mapping_type or 'unknown'} mapping removed from authoritative output: "
+                    f"{identifier or '<empty>'}"
+                )
         normalized_mappings.append(mapping)
+
+    decisions: dict[tuple[str, str], set[str]] = {}
+    for mapping in normalized_mappings:
+        key = (mapping.get("mapping_type", ""), mapping.get("identifier", ""))
+        decisions.setdefault(key, set()).add(mapping.get("applicability", "unsupported"))
+    contradictory = {
+        key for key, values in decisions.items()
+        if values & {"direct", "supporting", "conditional"}
+        and values & {"rejected", "unsupported"}
+    }
+    if contradictory:
+        for mapping in normalized_mappings:
+            key = (mapping.get("mapping_type", ""), mapping.get("identifier", ""))
+            if key in contradictory:
+                mapping["applicability"] = "unsupported"
+                mapping["rationale"] = (
+                    str(mapping.get("rationale") or "")
+                    + " Conflicting applicability decisions were returned for this identifier."
+                ).strip()
+                grounding_issues.append(
+                    f"Contradictory mapping decisions require review: {key[0]} {key[1]}"
+                )
     data["mappings"] = normalized_mappings
 
     # Legacy flat arrays remain intentionally strict: only direct, source-backed
     # identifiers reach reports and integrations that cannot represent nuance.
-    data["matched_cves"] = [
+    data["matched_cves"] = list(dict.fromkeys([
         item["identifier"]
         for item in normalized_mappings
         if item.get("mapping_type") == "cve"
         and item.get("applicability") == "direct"
         and _CVE_ID.fullmatch(item.get("identifier", ""))
-    ]
-    data["matched_techniques"] = [
+    ]))
+    data["matched_techniques"] = list(dict.fromkeys([
         item["identifier"]
         for item in normalized_mappings
         if item.get("mapping_type") == "attack"
         and item.get("applicability") == "direct"
         and _ATTACK_ID.fullmatch(item.get("identifier", ""))
-    ]
+    ]))
+    for key in ("missing_evidence", "recommended_next_steps"):
+        values = data.get(key)
+        data[key] = list(dict.fromkeys(
+            str(value).strip()[:1000]
+            for value in values or []
+            if str(value).strip()
+        ))[:20]
+    data["grounding_issues"] = list(dict.fromkeys(grounding_issues))
 
 
 def _representative_text(text: str, limit: int) -> tuple[str, bool]:
@@ -357,14 +575,18 @@ async def validate_finding(
     evidence_block = ""
     if selected_evidence:
         evidence_block += "\n\n=== TEXT/LOG EVIDENCE ===\n"
-        evidence_block += "\n---\n".join(selected_evidence)
+        evidence_block += "\n---\n".join(
+            f"[TEXT{i}] {text}" for i, text in enumerate(selected_evidence, 1)
+        )
 
     if selected_images:
         evidence_block += "\n\n=== SCREENSHOT/IMAGE EVIDENCE (vision-extracted) ===\n"
-        evidence_block += "\n---\n".join(selected_images)
+        evidence_block += "\n---\n".join(
+            f"[IMAGE{i}] {text}" for i, text in enumerate(selected_images, 1)
+        )
 
     user_message = f"""FINDING TO VALIDATE:
-{finding_context}
+[FINDING1] {finding_context}
 {evidence_block}
 
 === DATA COVERAGE ===
@@ -384,8 +606,21 @@ Validate this finding and return your JSON verdict."""
         max_tokens=2800,
         )
 
-    _normalize_assessment(data, outcome)
+    _normalize_assessment(
+        data,
+        outcome,
+        text_evidence_count=len(selected_evidence),
+        image_evidence_count=len(selected_images),
+    )
     result = ValidationResult(**data)
+
+    if result.grounding_issues and result.confidence > 0.7:
+        log.info(
+            "Capping confidence %.2f -> 0.7: deterministic grounding checks found %d issue(s)",
+            result.confidence,
+            len(result.grounding_issues),
+        )
+        result.confidence = 0.7
 
     # 5. A verdict can never be more certain than its evidence. When a source
     #    was unreachable the model was working from partial coverage, so an

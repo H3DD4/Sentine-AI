@@ -2,7 +2,12 @@ import unittest
 
 from app.kb.base import RetrievalHit
 from app.kb.sources import GhostwriterSource, MitreSource, NVDSource, OwaspDocsSource, OwaspSource
-from app.services.retrieval import _preserve_source_coverage, _prioritize_ghostwriter, _weighted_rrf
+from app.services.retrieval import (
+    _pin_exact_matches,
+    _preserve_source_coverage,
+    _prioritize_ghostwriter,
+    _weighted_rrf,
+)
 
 
 def _hits(source, count, *, exact_index=None):
@@ -75,6 +80,13 @@ class RetrievalFusionTests(unittest.TestCase):
         restored = _preserve_source_coverage(original[:2], original)
 
         self.assertEqual([hit.source_key for hit in restored], ["nvd", "mitre", "nvd"])
+
+    def test_exact_identifier_is_re_pinned_after_reranking(self):
+        nvd = NVDSource()
+        exact = _hits(nvd, 1, exact_index=0)[0]
+        semantic = _hits(nvd, 1)[0]
+        restored = _pin_exact_matches([semantic], [exact, semantic])
+        self.assertEqual(restored[0].payload["matched_by"], "exact_id")
 
 
 if __name__ == "__main__":

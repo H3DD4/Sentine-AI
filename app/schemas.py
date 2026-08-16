@@ -29,6 +29,7 @@ class ImpactClaim(BaseModel):
     level: ImpactEvidenceLevel
     statement: str
     evidence_basis: str
+    evidence_ids: List[str] = Field(default_factory=list)
     conditions: List[str] = Field(default_factory=list)
 
 
@@ -86,7 +87,7 @@ class CVSSAssessment(BaseModel):
 
 
 class SecurityMapping(BaseModel):
-    mapping_type: Literal["cve", "cwe", "owasp", "attack"]
+    mapping_type: Literal["cve", "cwe", "owasp", "attack", "template"]
     identifier: str
     name: str = ""
     applicability: Literal["direct", "supporting", "conditional", "rejected", "unsupported"]
@@ -192,7 +193,7 @@ class TokenWithRefresh(BaseModel):
 
 class ValidationResult(BaseModel):
     verdict: VerdictEnum
-    confidence: float                    # 0.0 – 1.0
+    confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
     matched_cves: List[str]
     matched_techniques: List[str]
@@ -200,6 +201,7 @@ class ValidationResult(BaseModel):
     missing_evidence: List[str]
     recommended_next_steps: List[str]
     impact_assessment: ImpactAssessment = Field(default_factory=ImpactAssessment)
+    grounding_issues: List[str] = Field(default_factory=list)
 
 
 class SourceStatus(BaseModel):

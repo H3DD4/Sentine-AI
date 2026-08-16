@@ -205,6 +205,11 @@ class KBSource(ABC):
         return self.model.__tablename__
 
     @property
+    def exact_id_payload_field(self) -> str:
+        """Payload field queried when this source recognizes a canonical ID."""
+        return "doc_id"
+
+    @property
     @abstractmethod
     def pk_column(self):
         """The model column holding the document's primary identifier."""

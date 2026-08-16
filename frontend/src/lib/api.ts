@@ -205,6 +205,15 @@ export interface GenerationInfo {
   fallback_used: boolean;
 }
 
+export type StreamStageStatus = "pending" | "active" | "complete" | "error";
+
+export interface StreamStage {
+  key: string;
+  label: string;
+  status: StreamStageStatus;
+  detail: string;
+}
+
 export interface ProcessingFile {
   filename: string;
   file_type: string;
@@ -224,6 +233,8 @@ export interface ProcessingManifest {
 export interface ChatResponse extends Partial<Provenance> {
   response: string;
   generation?: GenerationInfo | null;
+  grounding_issues?: string[];
+  corrected?: boolean;
   processing?: ProcessingManifest;
 }
 
@@ -543,6 +554,7 @@ export function streamChatMessage(
   onAbort?: () => void,
   onGeneration?: (generation: GenerationInfo) => void,
   model?: string,
+  onStage?: (stage: StreamStage) => void,
 ): () => void {
   const controller = new AbortController();
   let manuallyAborted = false;
@@ -606,6 +618,17 @@ export function streamChatMessage(
           // Errors are raised outside the try above, so a genuine backend
           // error is not swallowed by the JSON-parse handler.
           if (payload.error) throw new Error(String(payload.error));
+          if (payload.stage && onStage) {
+            const stage = payload.stage as Partial<StreamStage>;
+            if (
+              typeof stage.key === "string" &&
+              typeof stage.label === "string" &&
+              typeof stage.status === "string" &&
+              typeof stage.detail === "string"
+            ) {
+              onStage(stage as StreamStage);
+            }
+          }
           if (payload.done) {
             finish(onDone);
             return;

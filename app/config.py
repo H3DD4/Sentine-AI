@@ -20,12 +20,13 @@ class Settings(BaseSettings):
     # Legacy single-collection name — read only by the backfill script.
     # Retrieval uses one collection per source: kb_<source_key>.
     QDRANT_COLLECTION: str = "kb_entries"
-    EMBEDDING_MODEL: str = "BAAI/bge-base-en-v1.5"
-    RERANKER_MODEL: str = "BAAI/bge-reranker-base"
-    # Cross-encoder reranking is the single biggest precision win in the
-    # pipeline, but it costs ~50-150ms per query on CPU. Disable to trade
-    # precision for latency.
-    RERANK_ENABLED: bool = True
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
+    RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    EMBEDDING_CHUNK_TOKENS: int = 800
+    EMBEDDING_CHUNK_OVERLAP_TOKENS: int = 100
+    # Keep the large cross-encoder off on small local machines. Hybrid BGE-M3
+    # plus BM25 remains multilingual and avoids adding seconds to each query.
+    RERANK_ENABLED: bool = False
     RERANK_CANDIDATES: int = 15
     # CPU inference for 15 cross-encoder pairs takes well over three seconds on
     # typical analyst workstations. A timeout below that silently forces every

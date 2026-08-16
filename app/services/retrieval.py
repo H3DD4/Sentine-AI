@@ -272,13 +272,23 @@ def _exact_id_query_sync(
     qfilter: Optional[Filter],
 ) -> list[Any]:
     """Direct payload lookup for identifiers found verbatim in the query."""
-    must = [FieldCondition(key="doc_id", match=MatchAny(any=doc_ids))]
+    payload_field = getattr(source, "exact_id_payload_field", "doc_id")
+    if not isinstance(payload_field, str):
+        payload_field = "doc_id"
+    must = [
+        FieldCondition(
+            key=payload_field,
+            match=MatchAny(any=doc_ids),
+        )
+    ]
     if qfilter:
         must.extend(qfilter.must or [])
     res = qdrant.query_points(
         collection_name=source.collection,
         query_filter=Filter(must=must),
-        limit=len(doc_ids) * 4,  # a doc may have several chunks
+        # Internal template codes can be reused across categories and each
+        # matching document may have several chunks.
+        limit=max(len(doc_ids) * 12, 40),
         with_payload=True,
     )
     return res.points
@@ -501,6 +511,25 @@ def _preserve_source_coverage(
     return restored
 
 
+def _pin_exact_matches(
+    ranked: list[RetrievalHit], original: list[RetrievalHit]
+) -> list[RetrievalHit]:
+    """Restore exact-ID documents above semantic reranker output."""
+    exact = [
+        hit for hit in [*original, *ranked]
+        if hit.payload.get("matched_by") == "exact_id"
+    ]
+    out: list[RetrievalHit] = []
+    seen: set[tuple[str, str]] = set()
+    for hit in [*exact, *ranked]:
+        key = (hit.source_key, hit.doc_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+    return out
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
@@ -612,6 +641,7 @@ async def federated_search(
             notes.append(note)
 
     fused = _preserve_source_coverage(fused, pre_rerank)
+    fused = _pin_exact_matches(fused, pre_rerank)
 
     # Ghostwriter is the firm's methodological corpus. Preserve its strongest
     # relevant result in the bounded answer context, while keeping every other

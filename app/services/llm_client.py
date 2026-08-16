@@ -474,14 +474,16 @@ class AsyncLLMClient:
         system: str,
         user_message: str,
         max_tokens: int = 1500,
+        model: Optional[str] = None,
+        parse_attempts: int = 3,
     ) -> dict:
         """
         Generate validation result as a parsed dict.
         Uses structured output where available; retries on JSON parse failure.
         """
         p = self.provider
-        primary = _get_model(p, "validation")
-        models = _model_chain(p, "validation", primary)
+        primary = model or _get_model(p, "validation")
+        models = [primary] if model else _model_chain(p, "validation", primary)
 
         # Bound before the loop so the failure log below is always reportable.
         # `generate` itself can raise ValueError (a refusal, an empty
@@ -492,7 +494,8 @@ class AsyncLLMClient:
         # handler existed to produce.
         raw: str = ""
 
-        for attempt in range(3):
+        parse_attempts = max(1, min(int(parse_attempts), 3))
+        for attempt in range(parse_attempts):
             try:
                 raw = await self._generate_with_fallback(
                     [{"role": "user", "content": user_message}],
@@ -502,17 +505,17 @@ class AsyncLLMClient:
                 )
                 return _extract_json(raw)
             except (json.JSONDecodeError, ValueError) as exc:
-                if attempt == 2:
+                if attempt == parse_attempts - 1:
                     log.error(
-                        "Validation JSON parse failed after 3 attempts: %s\nRaw: %s",
-                        exc,
+                        "Validation JSON parse failed after %d attempt(s): %s\nRaw: %s",
+                        parse_attempts, exc,
                         raw[:500] if raw else "<no completion returned>",
                     )
                     raise
                 log.warning("JSON parse attempt %d failed, retrying…", attempt + 1)
                 await asyncio.sleep(0.5)
 
-        # Unreachable: attempt 2 either returns or re-raises. Present so the
+        # Unreachable: the final attempt either returns or re-raises. Present so the
         # function has no implicit `None` path — a caller that got None here
         # would fail much later, far from the cause.
         raise RuntimeError("generate_validation exhausted retries without a result")

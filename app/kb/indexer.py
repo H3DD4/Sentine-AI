@@ -100,6 +100,12 @@ _SOURCE_INDEXES: dict[str, dict[str, PayloadSchemaType]] = {
         "doc_type": PayloadSchemaType.KEYWORD,
         "tags": PayloadSchemaType.KEYWORD,
     },
+    "finding_templates": {
+        "template_code": PayloadSchemaType.KEYWORD,
+        "record_kind": PayloadSchemaType.KEYWORD,
+        "category": PayloadSchemaType.KEYWORD,
+        "source_file": PayloadSchemaType.KEYWORD,
+    },
 }
 
 
@@ -157,6 +163,14 @@ async def ensure_all_collections(qdrant, sources: Iterable[KBSource]) -> None:
             await ensure_collection(qdrant, src)
         except Exception as exc:
             log.warning("Could not ensure collection for %s: %s", src.key, exc)
+
+
+async def rebuild_collection(qdrant, source: KBSource, *, dim: Optional[int] = None) -> None:
+    """Recreate one source collection for an embedding dimension/model change."""
+    exists = await asyncio.to_thread(qdrant.collection_exists, source.collection)
+    if exists:
+        await asyncio.to_thread(qdrant.delete_collection, source.collection)
+    await ensure_collection(qdrant, source, dim=dim)
 
 
 # ── Indexing ─────────────────────────────────────────────────────────────────

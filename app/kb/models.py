@@ -266,6 +266,44 @@ class InternalDoc(Base, KBSyncMixin):
     author = Column(String(256), nullable=True)
 
 
+# ── Source 7: Firm-authored finding templates ────────────────────────────────
+
+
+class FindingTemplate(Base, KBSyncMixin):
+    """One structured finding or positive-practice card parsed from a firm DOCX."""
+
+    __tablename__ = "finding_templates"
+
+    # Codes are reused between sections and documents. The deterministic ID
+    # includes document identity and table position; template_code remains the
+    # analyst-facing identifier used for literal retrieval.
+    id = Column(String(64), primary_key=True)
+    template_code = Column(String(32), nullable=False, index=True)
+    record_kind = Column(String(32), nullable=False, index=True)
+    source_file = Column(String(512), nullable=False, index=True)
+    source_file_hash = Column(String(64), nullable=False)
+    source_table_index = Column(Integer, nullable=False)
+
+    section = Column(String(256), nullable=True)
+    category = Column(String(256), nullable=True, index=True)
+    topic = Column(String(512), nullable=True)
+    title = Column(String(512), nullable=False, default="")
+
+    iso_references = Column(JSON, default=list, nullable=False)
+    observations = Column(Text, nullable=False, default="")
+    evidence_template = Column(Text, nullable=True)
+    affected_elements = Column(Text, nullable=True)
+    impact = Column(Text, nullable=True)
+    recommendation = Column(Text, nullable=True)
+    implementation_complexity = Column(String(128), nullable=True)
+    implementation_priority = Column(String(128), nullable=True)
+    risk_assessments = Column(JSON, default=list, nullable=False)
+
+    raw_fields = Column(JSON, default=dict, nullable=False)
+    parse_warnings = Column(JSON, default=list, nullable=False)
+    parser_version = Column(String(32), nullable=False)
+
+
 # ── Source health registry ───────────────────────────────────────────────────
 
 

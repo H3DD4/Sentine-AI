@@ -51,19 +51,24 @@ _model_lock = threading.Lock()
 #: wrong — prefer rank-based fusion over raw-score cutoffs.
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-#: Model's real token window.
-MAX_TOKENS = 512
-#: Leave room for the prefix and special tokens rather than truncating mid-word.
-CHUNK_TOKENS = 480
-#: Overlap so a fact spanning a boundary survives in at least one whole chunk.
-CHUNK_OVERLAP_TOKENS = 64
-
-EMBED_DIM = 768
+EMBED_DIM = 1024
 
 
 def _uses_bge_prefix() -> bool:
     """Only BGE-family models want the query instruction."""
-    return "bge" in (settings.EMBEDDING_MODEL or "").lower()
+    name = (settings.EMBEDDING_MODEL or "").lower()
+    return "bge" in name and "bge-m3" not in name
+
+
+def chunk_config() -> tuple[int, int]:
+    """Return a model-safe passage window and overlap from runtime settings."""
+    model = get_model()
+    model_limit = int(getattr(model, "max_seq_length", 512) or 512)
+    requested = max(32, int(settings.EMBEDDING_CHUNK_TOKENS))
+    chunk_tokens = min(requested, max(32, model_limit - 16))
+    overlap = max(0, int(settings.EMBEDDING_CHUNK_OVERLAP_TOKENS))
+    overlap = min(overlap, chunk_tokens // 3)
+    return chunk_tokens, overlap
 
 
 def load_model_sync() -> None:
@@ -138,19 +143,20 @@ def chunk_text(text: str) -> list[str]:
     tokenizer = model.tokenizer
     ids = tokenizer.encode(text, add_special_tokens=False)
 
-    if len(ids) <= CHUNK_TOKENS:
+    chunk_tokens, overlap_tokens = chunk_config()
+    if len(ids) <= chunk_tokens:
         return [text]
 
-    step = CHUNK_TOKENS - CHUNK_OVERLAP_TOKENS
+    step = chunk_tokens - overlap_tokens
     chunks: list[str] = []
     for start in range(0, len(ids), step):
-        window = ids[start : start + CHUNK_TOKENS]
+        window = ids[start : start + chunk_tokens]
         if not window:
             break
         chunk = tokenizer.decode(window, skip_special_tokens=True).strip()
         if chunk:
             chunks.append(chunk)
-        if start + CHUNK_TOKENS >= len(ids):
+        if start + chunk_tokens >= len(ids):
             break
     return chunks or [text]
 
@@ -212,6 +218,7 @@ def embed_chunks(text: str) -> list[tuple[int, str, list[float]]]:
 # away. Running both arms and fusing is why hybrid beats either alone.
 
 _sparse_model = None
+_sparse_failed = False
 _sparse_lock = threading.Lock()
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 #: Named vector key used in Qdrant for the sparse arm.
@@ -236,29 +243,35 @@ def load_sparse_model_sync() -> None:
     the dense model: callers already handle this raising (retrieval drops to
     dense-only and says so), but nothing handles it *blocking*.
     """
-    global _sparse_model
+    global _sparse_model, _sparse_failed
     with _sparse_lock:
         if _sparse_model is None:
+            if _sparse_failed:
+                raise RuntimeError("Sparse model is unavailable in this process")
             from fastembed import SparseTextEmbedding
 
             offline = not getattr(settings, "ALLOW_MODEL_DOWNLOADS", False)
             log.info(
                 "Loading sparse model: %s (offline=%s) …", SPARSE_MODEL_NAME, offline
             )
-            if offline:
-                # fastembed has no local_files_only flag; HF_HUB_OFFLINE is the
-                # supported way to force its downloader to use cache only.
-                prev = os.environ.get("HF_HUB_OFFLINE")
-                os.environ["HF_HUB_OFFLINE"] = "1"
-                try:
+            try:
+                if offline:
+                    # fastembed has no local_files_only flag; HF_HUB_OFFLINE is
+                    # the supported way to force its downloader to use cache only.
+                    prev = os.environ.get("HF_HUB_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    try:
+                        _sparse_model = SparseTextEmbedding(SPARSE_MODEL_NAME)
+                    finally:
+                        if prev is None:
+                            os.environ.pop("HF_HUB_OFFLINE", None)
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = prev
+                else:
                     _sparse_model = SparseTextEmbedding(SPARSE_MODEL_NAME)
-                finally:
-                    if prev is None:
-                        os.environ.pop("HF_HUB_OFFLINE", None)
-                    else:
-                        os.environ["HF_HUB_OFFLINE"] = prev
-            else:
-                _sparse_model = SparseTextEmbedding(SPARSE_MODEL_NAME)
+            except Exception:
+                _sparse_failed = True
+                raise
             log.info("Sparse model ready.")
 
 
@@ -326,7 +339,11 @@ def current_embed_signature() -> str:
     stored signature no longer matches are known to need re-embedding. Without
     it, a model swap leaves a silently incoherent index.
     """
-    return f"{settings.EMBEDDING_MODEL}|{CHUNK_TOKENS}|{CHUNK_OVERLAP_TOKENS}"
+    chunk_tokens, overlap_tokens = chunk_config()
+    return (
+        f"{settings.EMBEDDING_MODEL}|{SPARSE_MODEL_NAME}|"
+        f"{chunk_tokens}|{overlap_tokens}"
+    )
 
 
 # ── Backwards compatibility ──────────────────────────────────────────────────
