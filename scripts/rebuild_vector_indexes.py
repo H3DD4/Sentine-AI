@@ -25,7 +25,7 @@ from app.kb.registry import all_sources, get_source, source_keys
 from app.services.retrieval import get_qdrant, init_qdrant_client
 
 
-async def rebuild(source_key: str) -> None:
+async def rebuild(source_key: str, *, recreate: bool = False, batch_size: int = 8) -> None:
     # Load before deleting any collection. A missing or incompatible model must
     # fail while the old indexes are still intact.
     load_model_sync()
@@ -86,7 +86,7 @@ async def rebuild(source_key: str) -> None:
                 )
                 continue
 
-            if collection_info is not None and configured_dim == dim:
+            if collection_info is not None and configured_dim == dim and not recreate:
                 print(
                     f"\nResuming {source.key}: rows={rows}, unsynced={unsynced}, "
                     f"current_signature_rows={current_signature_rows}, vectors={vectors}, "
@@ -112,7 +112,7 @@ async def rebuild(source_key: str) -> None:
                     if not pending:
                         break
                     batch = await index_rows(
-                        source, session, qdrant, pending, force=False
+                        source, session, qdrant, pending, force=False, batch_size=batch_size
                     )
                     stats.considered += batch.considered
                     stats.indexed += batch.indexed
@@ -150,7 +150,9 @@ async def rebuild(source_key: str) -> None:
             )
             await session.commit()
 
-            stats = await reindex_source(source, session, qdrant, force=True)
+            stats = await reindex_source(
+                source, session, qdrant, force=True, batch_size=batch_size
+            )
             print(f"  {source.key}: {stats.to_dict()}")
             if stats.failed:
                 raise RuntimeError(
@@ -162,6 +164,12 @@ async def rebuild(source_key: str) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", choices=("all", *source_keys()), default="all")
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Recreate selected collections before reindexing (for index text format changes).",
+    )
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    asyncio.run(rebuild(args.source))
+    asyncio.run(rebuild(args.source, recreate=args.recreate, batch_size=max(1, args.batch_size)))

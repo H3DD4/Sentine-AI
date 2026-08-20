@@ -14,7 +14,16 @@ import {
   TableSkeleton,
 } from "@/components/ui/loading-skeletons";
 import { toast } from "sonner";
-import { Plus, ArrowUpRight, Activity, ShieldAlert, Target, Zap, MessageSquare, Trash2 } from "lucide-react";
+import {
+  Plus,
+  ArrowUpRight,
+  Activity,
+  ShieldAlert,
+  Target,
+  Zap,
+  MessageSquare,
+  Trash2,
+} from "lucide-react";
 
 export const Route = createFileRoute("/")({ component: Dashboard });
 

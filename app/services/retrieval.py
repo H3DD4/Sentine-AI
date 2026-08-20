@@ -444,27 +444,25 @@ def _weighted_rrf(
     per_source: list[tuple[KBSource, list[RetrievalHit]]]
 ) -> list[RetrievalHit]:
     """
-    Interleave independent per-source rankings for the reranker candidate set.
+    Rank hybrid candidates globally using Qdrant's in-collection RRF score.
 
-    A document exists in exactly one source, so cross-source RRF has no ranks to
-    fuse: multiplying each source-local rank by its source weight makes the
-    weight dominate relevance. With RRF_K=60, the old 1.15 OWASP weight put its
-    first 10+ documents ahead of every rank-0 MITRE/NVD match. Rank is therefore
-    the primary key, while editorial trust breaks ties at the same rank.
+    Qdrant has already fused dense and sparse retrieval for each source. The old
+    implementation discarded that signal and interleaved sources by local rank,
+    guaranteeing one result per source instead of ranking relevance. Source
+    weight is only a modest trust multiplier and must not replace relevance.
 
-    Exact identifiers are globally pinned before semantic matches. This keeps
-    a named CVE or ATT&CK technique deterministic without letting one source
-    monopolize the fallback list when the cross-encoder is unavailable.
+    Exact identifiers are pinned separately and remain above semantic candidates.
     """
-    scored: list[tuple[bool, int, float, int, RetrievalHit]] = []
+    scored: list[tuple[bool, float, int, int, RetrievalHit]] = []
     for source_index, (source, hits) in enumerate(per_source):
         for rank, hit in enumerate(hits):
             exact = hit.payload.get("matched_by") == "exact_id"
-            scored.append((not exact, rank, -source.weight, source_index, hit))
+            effective = float(hit.score or 0.0) * (1.0 + 0.10 * (source.weight - 1.0))
+            scored.append((not exact, -effective, rank, source_index, hit))
 
-    merged: dict[tuple[str, str], tuple[bool, int, float, int, RetrievalHit]] = {}
+    merged: dict[tuple[str, str], tuple[bool, float, int, int, RetrievalHit]] = {}
     for item in scored:
-        exact_sort, rank, neg_weight, source_index, hit = item
+        exact_sort, _neg_score, rank, source_index, hit = item
         key = (hit.source_key, hit.doc_id)
         prev = merged.get(key)
         if prev is None or item[:4] < prev[:4]:
@@ -472,8 +470,7 @@ def _weighted_rrf(
 
     ordered = sorted(merged.values(), key=lambda item: item[:4])
     out = []
-    for final_rank, (not_exact, source_rank, _neg_weight, _source_index, hit) in enumerate(ordered):
-        hit.score = 1.0 if not not_exact else 1.0 / (RRF_K + source_rank + 1)
+    for final_rank, (_not_exact, _neg_score, _source_rank, _source_index, hit) in enumerate(ordered):
         hit.rank = final_rank
         out.append(hit)
     return out
@@ -640,13 +637,7 @@ async def federated_search(
         if note:
             notes.append(note)
 
-    fused = _preserve_source_coverage(fused, pre_rerank)
     fused = _pin_exact_matches(fused, pre_rerank)
-
-    # Ghostwriter is the firm's methodological corpus. Preserve its strongest
-    # relevant result in the bounded answer context, while keeping every other
-    # source and any exact identifier match visible as well.
-    fused = _prioritize_ghostwriter(fused)
 
     final = fused[:top_k]
 

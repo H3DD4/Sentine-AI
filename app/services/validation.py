@@ -305,6 +305,19 @@ def _normalize_cvss(assessment: dict) -> bool:
             cvss["version"] = versions.pop()
             if float(lower.get("score", 0)) > float(upper.get("score", 0)):
                 raise ValueError("calculated lower bound exceeds upper bound")
+        else:
+            # Provider JSON is untrusted and commonly uses null for fields that
+            # are intentionally absent. Normalize the pending shape before it
+            # reaches the strict persisted CVSS schema.
+            cvss.update({
+                "status": status,
+                "version": "",
+                "vector": "",
+                "score": None,
+                "severity": "",
+                "lower_bound": None,
+                "upper_bound": None,
+            })
         return True
     except (CVSS3MalformedError, CVSS4MalformedError, KeyError, TypeError, ValueError):
         assessment["cvss"] = {

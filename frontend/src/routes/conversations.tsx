@@ -4,11 +4,7 @@ import { PageHeader } from "@/components/layout/PageHeader";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  listConversations,
-  deleteConversation,
-  updateConversation,
-} from "@/lib/api";
+import { listConversations, deleteConversation, updateConversation } from "@/lib/api";
 import type { AnalysisConversation } from "@/lib/api";
 import { toast } from "sonner";
 import { useState } from "react";
@@ -67,8 +63,7 @@ function ConversationCard({
     <Card
       className="group relative flex flex-col gap-3 border border-border bg-white p-4 transition-all hover:border-brand-cyan hover:shadow-md cursor-pointer"
       onClick={() => {
-        if (!editing)
-          navigate({ to: "/chat", search: { conversation: conversation.id } as never });
+        if (!editing) navigate({ to: "/chat", search: { conversation: conversation.id } as never });
       }}
     >
       {/* Header row */}
@@ -79,10 +74,7 @@ function ConversationCard({
 
         <div className="min-w-0 flex-1">
           {editing ? (
-            <div
-              className="flex items-center gap-1"
-              onClick={(e) => e.stopPropagation()}
-            >
+            <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
               <input
                 autoFocus
                 value={title}
@@ -103,7 +95,10 @@ function ConversationCard({
                 <Check className="h-3.5 w-3.5" />
               </button>
               <button
-                onClick={() => { setTitle(conversation.title); setEditing(false); }}
+                onClick={() => {
+                  setTitle(conversation.title);
+                  setEditing(false);
+                }}
                 className="p-1 text-muted-foreground hover:bg-muted rounded"
               >
                 <X className="h-3.5 w-3.5" />
@@ -119,7 +114,9 @@ function ConversationCard({
             <Clock className="h-3 w-3 shrink-0" />
             <span>{timeAgo(conversation.updated_at)}</span>
             <span className="text-border">·</span>
-            <span>{msgCount} message{msgCount !== 1 ? "s" : ""}</span>
+            <span>
+              {msgCount} message{msgCount !== 1 ? "s" : ""}
+            </span>
           </div>
         </div>
 
@@ -188,8 +185,7 @@ function ConversationsPage() {
   });
 
   const renameMut = useMutation({
-    mutationFn: ({ id, title }: { id: string; title: string }) =>
-      updateConversation(id, { title }),
+    mutationFn: ({ id, title }: { id: string; title: string }) => updateConversation(id, { title }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
       toast.success("Renamed");
@@ -233,13 +229,12 @@ function ConversationsPage() {
         {!isLoading && (
           <div className="flex items-center gap-4 text-sm text-muted-foreground">
             <span>
-              <span className="font-semibold text-foreground">{conversations.length}</span>{" "}
-              total session{conversations.length !== 1 ? "s" : ""}
+              <span className="font-semibold text-foreground">{conversations.length}</span> total
+              session{conversations.length !== 1 ? "s" : ""}
             </span>
             {search && (
               <span>
-                <span className="font-semibold text-foreground">{filtered.length}</span>{" "}
-                matching
+                <span className="font-semibold text-foreground">{filtered.length}</span> matching
               </span>
             )}
           </div>
@@ -249,10 +244,7 @@ function ConversationsPage() {
         {isLoading ? (
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-28 animate-pulse rounded border border-border bg-muted"
-              />
+              <div key={i} className="h-28 animate-pulse rounded border border-border bg-muted" />
             ))}
           </div>
         ) : filtered.length === 0 ? (

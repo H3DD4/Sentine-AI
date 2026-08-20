@@ -25,6 +25,33 @@ log = logging.getLogger(__name__)
 _model_circuits: dict[tuple[str, str], float] = {}
 _model_probes: set[tuple[str, str]] = set()
 _circuit_lock = threading.RLock()
+_rate_limiters: dict[tuple[str, str], tuple[asyncio.Semaphore, float]] = {}
+_rate_limit_lock = threading.RLock()
+
+
+def _rate_limiter(provider: LLMProvider, model: str) -> tuple[asyncio.Semaphore, float]:
+    key = (provider.value, model)
+    with _rate_limit_lock:
+        limiter = _rate_limiters.get(key)
+        if limiter is None:
+            limiter = (asyncio.Semaphore(max(1, settings.LLM_RATE_LIMIT_REQUESTS)), 0.0)
+            _rate_limiters[key] = limiter
+        return limiter
+
+
+async def _acquire_rate_limit(provider: LLMProvider, model: str) -> None:
+    semaphore, last_request = _rate_limiter(provider, model)
+    await semaphore.acquire()
+    interval = settings.LLM_RATE_LIMIT_WINDOW_SECONDS / max(1, settings.LLM_RATE_LIMIT_REQUESTS)
+    delay = interval - (time.monotonic() - last_request)
+    if delay > 0:
+        await asyncio.sleep(delay)
+    with _rate_limit_lock:
+        _rate_limiters[(provider.value, model)] = (semaphore, time.monotonic())
+
+
+def _release_rate_limit(provider: LLMProvider, model: str) -> None:
+    _rate_limiter(provider, model)[0].release()
 
 
 def _is_retryable_provider_error(exc: Exception) -> bool:
@@ -46,6 +73,34 @@ def _is_retryable_provider_error(exc: Exception) -> bool:
         "overloaded",
     )
     return any(marker in text for marker in markers)
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Read provider retry guidance across OpenAI-compatible SDK errors."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error") or body
+        metadata = error.get("metadata") if isinstance(error, dict) else None
+        value = (metadata or {}).get("retry_after_seconds") if isinstance(metadata, dict) else None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _capacity_retry_delay(exc: Exception, attempt: int) -> float:
+    configured = max(0.5, settings.LLM_RATE_LIMIT_WINDOW_SECONDS) * (2 ** attempt)
+    requested = _retry_after_seconds(exc) or 0.0
+    return min(settings.LLM_RATE_LIMIT_MAX_BACKOFF_SECONDS, max(configured, requested))
 
 
 def _model_available(provider: LLMProvider, model: str) -> bool:
@@ -119,10 +174,17 @@ def _extract_json(raw: str) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # Find first {...} block
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if match:
-        return json.loads(match.group())
+    # Providers may prepend reasoning or duplicate a wrapper brace. Try each
+    # opening brace with JSONDecoder so bounded wrapper noise does not discard
+    # an otherwise valid structured draft. No fields are invented or repaired.
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", raw):
+        try:
+            value, _ = decoder.raw_decode(raw[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
     raise json.JSONDecodeError("No JSON object found in LLM response", raw, 0)
 
 
@@ -246,6 +308,9 @@ class AsyncLLMClient:
         system: str,
         max_tokens: int,
         models: list[str],
+        *,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
     ) -> str:
         last_error: Exception | None = None
         attempted = False
@@ -255,8 +320,14 @@ class AsyncLLMClient:
                 continue
             attempted = True
             for attempt in range(settings.LLM_CAPACITY_RETRIES + 1):
+                acquired = False
                 try:
-                    result = await self._generate_model(messages, system, max_tokens, model)
+                    await _acquire_rate_limit(self.provider, model)
+                    acquired = True
+                    result = await self._generate_model(
+                        messages, system, max_tokens, model,
+                        json_mode=json_mode, json_schema=json_schema,
+                    )
                     _close_model_circuit(self.provider, model)
                     self._record_generation(model, primary)
                     return result
@@ -266,7 +337,10 @@ class AsyncLLMClient:
                         raise
                     last_error = exc
                     if attempt < settings.LLM_CAPACITY_RETRIES:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                        await asyncio.sleep(_capacity_retry_delay(exc, attempt))
+                finally:
+                    if acquired:
+                        _release_rate_limit(self.provider, model)
             _open_model_circuit(self.provider, model)
             log.warning("Model %s is temporarily unavailable; trying fallback", model)
 
@@ -275,7 +349,8 @@ class AsyncLLMClient:
         raise RuntimeError("All configured models are temporarily unavailable") from last_error
 
     async def _generate_model(
-        self, messages: list[dict], system: str, max_tokens: int, model: str
+        self, messages: list[dict], system: str, max_tokens: int, model: str,
+        *, json_mode: bool = False, json_schema: dict | None = None
     ) -> str:
         p = self.provider
         if p == LLMProvider.anthropic:
@@ -286,7 +361,10 @@ class AsyncLLMClient:
             LLMProvider.openrouter,
             LLMProvider.ollama,
         ):
-            return await self._generate_openai_compat(messages, system, max_tokens, model, p)
+            return await self._generate_openai_compat(
+                messages, system, max_tokens, model, p,
+                json_mode=json_mode, json_schema=json_schema,
+            )
         if p == LLMProvider.gemini:
             return await self._generate_gemini(messages, system, max_tokens, model)
         raise ValueError(f"Unknown provider: {p}")
@@ -306,7 +384,8 @@ class AsyncLLMClient:
 
     async def _generate_openai_compat(
         self, messages: list[dict], system: str, max_tokens: int,
-        model: str, provider: LLMProvider
+        model: str, provider: LLMProvider, *, json_mode: bool = False,
+        json_schema: dict | None = None,
     ) -> str:
         if provider == LLMProvider.openai:
             client = self._openai_compat(settings.OPENAI_API_KEY, _get_openai_base_url())
@@ -322,10 +401,29 @@ class AsyncLLMClient:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
 
+        request = {
+            "model": model,
+            "messages": full_messages,
+            "max_tokens": max_tokens,
+        }
+        if json_schema:
+            request["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "grounded_security_draft",
+                    "strict": False,
+                    "schema": json_schema,
+                },
+            }
+        elif json_mode:
+            request["response_format"] = {"type": "json_object"}
+        # NVIDIA's Nemotron endpoint supports this OpenAI-compatible extra
+        # body option and otherwise emits a long reasoning preamble before JSON.
+        if provider == LLMProvider.openai and model.lower().startswith("nvidia/"):
+            request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+
         resp = await client.chat.completions.create(
-            model=model,
-            messages=full_messages,
-            max_tokens=max_tokens,
+            **request,
         )
         self.last_finish_reason = getattr(resp.choices[0], "finish_reason", None)
         return resp.choices[0].message.content or ""
@@ -476,6 +574,7 @@ class AsyncLLMClient:
         max_tokens: int = 1500,
         model: Optional[str] = None,
         parse_attempts: int = 3,
+        json_schema: dict | None = None,
     ) -> dict:
         """
         Generate validation result as a parsed dict.
@@ -502,6 +601,8 @@ class AsyncLLMClient:
                     system,
                     max_tokens,
                     models,
+                    json_mode=True,
+                    json_schema=json_schema,
                 )
                 return _extract_json(raw)
             except (json.JSONDecodeError, ValueError) as exc:
@@ -548,7 +649,10 @@ class AsyncLLMClient:
                     raise ValueError(f"Vision not supported for provider: {p}")
 
                 for attempt in range(settings.LLM_CAPACITY_RETRIES + 1):
+                    acquired = False
                     try:
+                        await _acquire_rate_limit(p, model)
+                        acquired = True
                         result = await _call()
                         _close_model_circuit(p, model)
                         return result
@@ -558,7 +662,10 @@ class AsyncLLMClient:
                             raise
                         last_error = exc
                         if attempt < settings.LLM_CAPACITY_RETRIES:
-                            await asyncio.sleep(0.5 * (attempt + 1))
+                            await asyncio.sleep(_capacity_retry_delay(exc, attempt))
+                    finally:
+                        if acquired:
+                            _release_rate_limit(p, model)
                 raise last_error
             except Exception as exc:
                 if not _is_retryable_provider_error(exc):

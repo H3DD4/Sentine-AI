@@ -9,7 +9,7 @@ Postgres + Qdrant, not mocks:
   3. Degradation is graceful and *observable* — asking for a source that has
      no index must still answer from the sources that do, and must say so.
 
-Run:  ./.venv/Scripts/python.exe scripts/smoke_retrieval.py
+Run:  python -m scripts.smoke_retrieval
 """
 
 from __future__ import annotations
@@ -56,11 +56,14 @@ async def main() -> None:
         )
         show(outcome)
 
-        print("\n=== 2. Exact-identifier recall (BM25 arm): 'CVE-2020-1938' " + "=" * 16)
-        outcome = await federated_search("CVE-2020-1938", session, top_k=5)
+        exact_cve = "CVE-2023-27159"
+        print(f"\n=== 2. Exact-identifier recall: '{exact_cve}' " + "=" * 24)
+        outcome = await federated_search(exact_cve, session, top_k=5)
         show(outcome, limit=3)
         ids = [h.doc_id for h in outcome.hits]
-        print(f"  → CVE-2020-1938 in results: {'CVE-2020-1938' in ids}")
+        exact_recalled = exact_cve in ids
+        print(f"  -> {exact_cve} in results: {exact_recalled}")
+        assert exact_recalled, f"exact identifier was not recalled: {exact_cve}"
 
         print("\n=== 3. Multimodal: description + log excerpt + screenshot " + "=" * 17)
         outcome = await multimodal_search(
@@ -83,24 +86,34 @@ async def main() -> None:
         )
         show(outcome)
 
-        print("\n=== 4. Degradation: request a source with no index " + "=" * 24)
-        # `ghostwriter` has no rows and no collection yet. The correct behaviour
+        print("\n=== 4. Partial coverage: request an empty source " + "=" * 24)
+        # `internal` has no rows yet. The correct behaviour
         # is not an exception and not a silent empty list — it is an answer from
         # whatever is available, carrying an explicit statement of the gap.
         outcome = await federated_search(
             "privilege escalation via misconfigured service",
             session,
-            sources=["nvd", "ghostwriter"],
+            sources=["nvd", "internal"],
             top_k=5,
         )
         show(outcome, limit=3)
+        assert outcome.hits, "available NVD source should still return results"
+        assert any(
+            report.source_key == "internal" and report.availability.value == "empty"
+            for report in outcome.reports
+        ), "empty requested source should be explicit in provenance"
 
-        print("\n=== 5. Degradation: every requested source unavailable " + "=" * 20)
+        print("\n=== 5. Empty-only source request " + "=" * 38)
         outcome = await federated_search(
-            "lateral movement", session, sources=["ghostwriter", "internal"], top_k=5
+            "lateral movement", session, sources=["internal"], top_k=5
         )
         show(outcome, limit=3)
-        print(f"  → hits={len(outcome.hits)} (expected 0), degraded={outcome.degraded}")
+        print(f"  -> hits={len(outcome.hits)} (expected 0), degraded={outcome.degraded}")
+        assert not outcome.hits, "an empty-only source request should have no hits"
+        assert any(
+            report.source_key == "internal" and report.availability.value == "empty"
+            for report in outcome.reports
+        ), "empty-only request should explain why it has no hits"
 
 
 if __name__ == "__main__":

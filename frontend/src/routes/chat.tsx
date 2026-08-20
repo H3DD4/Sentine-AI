@@ -142,7 +142,9 @@ function validationSummary(result: ValidationResponse): string {
   const impact = impactOf(result);
   const questions = impact.clarification_questions
     .map((item, index) => {
-      const options = item.answer_options.length ? ` Options: ${item.answer_options.join(", ")}.` : "";
+      const options = item.answer_options.length
+        ? ` Options: ${item.answer_options.join(", ")}.`
+        : "";
       return `${index + 1}. ${item.question}${options}`;
     })
     .join("\n");
@@ -158,8 +160,10 @@ function validationSummary(result: ValidationResponse): string {
       ? `**Technical Severity:** CVSS ${impact.cvss.version} ${impact.cvss.score?.toFixed(1)} ${impact.cvss.severity} — ${impact.cvss.vector}\n\n`
       : impact.cvss.status === "range" && impact.cvss.lower_bound && impact.cvss.upper_bound
         ? `**Technical Severity Range:** CVSS ${impact.cvss.version} ${impact.cvss.lower_bound.score.toFixed(1)}–${impact.cvss.upper_bound.score.toFixed(1)}; unresolved: ${impact.cvss.unresolved_metrics.join("; ")}\n\n`
+        : "") +
+    (questions
+      ? `**One context check:** Reply once with answers to these questions.\n${questions}\n\n`
       : "") +
-    (questions ? `**One context check:** Reply once with answers to these questions.\n${questions}\n\n` : "") +
     `**Matched CVEs:** ${result.matched_cves.length > 0 ? result.matched_cves.join(", ") : "None"}\n` +
     `**Matched Techniques:** ${result.matched_techniques.length > 0 ? result.matched_techniques.join(", ") : "None"}\n` +
     `**Missing Evidence:** ${result.missing_evidence.length > 0 ? result.missing_evidence.join("; ") : "None"}`
@@ -403,8 +407,7 @@ function ChatPage() {
     queryFn: getSettings,
   });
   const modelOptions = appSettings?.available_chat_models ?? [];
-  const selectedModelLabel =
-    selectedModel === "auto" ? "Auto" : modelLabel(selectedModel);
+  const selectedModelLabel = selectedModel === "auto" ? "Auto" : modelLabel(selectedModel);
 
   const selectModel = (model: string) => {
     setSelectedModel(model);
@@ -625,14 +628,7 @@ function ChatPage() {
       });
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [
-    conversationLoaded,
-    conversationTitle,
-    lastValidation,
-    messages,
-    readiness,
-    storageLoaded,
-  ]);
+  }, [conversationLoaded, conversationTitle, lastValidation, messages, readiness, storageLoaded]);
 
   /**
    * Start a fresh conversation.
@@ -968,6 +964,7 @@ function ChatPage() {
           if (!firstTokenReceived) setIsWaitingForFirstToken(true);
           followStream();
         },
+        conversationIdRef.current ?? undefined,
       );
 
       stopStreamRef.current = stop;
@@ -1262,10 +1259,15 @@ function ChatPage() {
                             <span>
                               Thinking
                               {waitingElapsed > 0 && (
-                                <span className="ml-1 tabular-nums text-xs">({waitingElapsed}s)</span>
+                                <span className="ml-1 tabular-nums text-xs">
+                                  ({waitingElapsed}s)
+                                </span>
                               )}
                               {waitingElapsed > 30 && (
-                                <span className="ml-1 text-xs text-amber-600"> — model is queuing, please wait…</span>
+                                <span className="ml-1 text-xs text-amber-600">
+                                  {" "}
+                                  — model is queuing, please wait…
+                                </span>
                               )}
                             </span>
                           </div>
@@ -1702,9 +1704,11 @@ function EvidencePanel({
                     <span className="mt-1 block font-semibold text-foreground">
                       {impact?.cvss.status === "exact"
                         ? `CVSS ${impact.cvss.version} · ${impact.cvss.score?.toFixed(1)} ${impact.cvss.severity}`
-                        : impact?.cvss.status === "range" && impact.cvss.lower_bound && impact.cvss.upper_bound
+                        : impact?.cvss.status === "range" &&
+                            impact.cvss.lower_bound &&
+                            impact.cvss.upper_bound
                           ? `CVSS ${impact.cvss.version} · ${impact.cvss.lower_bound.score.toFixed(1)}–${impact.cvss.upper_bound.score.toFixed(1)}`
-                        : "Pending evidence"}
+                          : "Pending evidence"}
                     </span>
                   </div>
                   <div>
@@ -1728,7 +1732,9 @@ function EvidencePanel({
                   <ol className="space-y-2 text-sm text-foreground">
                     {impact.clarification_questions.map((item, index) => (
                       <li key={item.question}>
-                        <span className="font-semibold">{index + 1}. {item.question}</span>
+                        <span className="font-semibold">
+                          {index + 1}. {item.question}
+                        </span>
                         {item.answer_options.length > 0 && (
                           <span className="block text-xs text-muted-foreground">
                             {item.answer_options.join(" · ")}

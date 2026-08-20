@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     # typical analyst workstations. A timeout below that silently forces every
     # query onto the lower-precision fusion fallback.
     RERANK_TIMEOUT_SECONDS: float = 30.0
+    RETRIEVAL_CACHE_ENABLED: bool = True
+    RETRIEVAL_CACHE_TTL_SECONDS: float = 300.0
+    RETRIEVAL_CACHE_MAX_ENTRIES: int = 512
+    RETRIEVAL_CACHE_BACKEND: str = "auto"
+    RETRIEVAL_CACHE_REDIS_URL: str = "redis://localhost:6379/0"
+    RETRIEVAL_CACHE_LOCK_SECONDS: float = 15.0
+    RETRIEVAL_CACHE_LOCK_WAIT_SECONDS: float = 2.0
+    RETRIEVAL_CACHE_TTL_JITTER_SECONDS: float = 30.0
+    RETRIEVAL_WORKSPACE_MAX_SEARCHES: int = 12
+    RETRIEVAL_WORKSPACE_MAX_HITS: int = 20
     # Whether model loading may reach the network.
     #
     # Off by default, and that default is deliberate: a model that is not in
@@ -48,8 +58,11 @@ class Settings(BaseSettings):
     ALLOW_MODEL_DOWNLOADS: bool = False
 
     # LLM Provider Selection
-    LLM_PROVIDER: LLMProvider = LLMProvider.anthropic
-    LLM_REQUEST_TIMEOUT_SECONDS: float = 45.0
+    LLM_PROVIDER: LLMProvider = LLMProvider.openrouter
+    # NVIDIA-hosted reasoning models can take longer than ordinary chat APIs.
+    # Keep this configurable while giving the verified direct endpoint enough
+    # time to finish a grounded response.
+    LLM_REQUEST_TIMEOUT_SECONDS: float = 120.0
     CHAT_MAX_TOKENS: int = 6000
     CHAT_MAX_CONTINUATIONS: int = 2
     VISION_STAGE_TIMEOUT_SECONDS: float = 30.0
@@ -63,10 +76,10 @@ class Settings(BaseSettings):
 
     # OpenAI / OpenAI-compatible (GPT-4o, DeepSeek, Mistral via compatible endpoints)
     OPENAI_API_KEY: str = ""
-    OPENAI_BASE_URL: str = "https://api.openai.com/v1"
-    OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
-    OPENAI_VALIDATION_MODEL: str = "gpt-4o-mini"
-    OPENAI_VISION_MODEL: str = "gpt-4o-mini"
+    OPENAI_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    OPENAI_CHAT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    OPENAI_VALIDATION_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b"
+    OPENAI_VISION_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b"
 
     # Together AI
     TOGETHER_API_KEY: str = ""
@@ -76,8 +89,8 @@ class Settings(BaseSettings):
 
     # OpenRouter
     OPENROUTER_API_KEY: str = ""
-    OPENROUTER_CHAT_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    OPENROUTER_VALIDATION_MODEL: str = "google/gemini-2.5-flash-lite"
+    OPENROUTER_CHAT_MODEL: str = "z-ai/glm-5.2:free"
+    OPENROUTER_VALIDATION_MODEL: str = "z-ai/glm-5.2:free"
     OPENROUTER_VISION_MODEL: str = "google/gemini-2.5-flash-lite"
     OPENROUTER_CHAT_FALLBACK_MODELS: list[str] = ["google/gemini-2.5-flash-lite"]
     OPENROUTER_VALIDATION_FALLBACK_MODELS: list[str] = []
@@ -86,6 +99,10 @@ class Settings(BaseSettings):
     ]
     LLM_MODEL_COOLDOWN_SECONDS: float = 120.0
     LLM_CAPACITY_RETRIES: int = 1
+    # Pace direct-provider requests to avoid burst-based 429 responses.
+    LLM_RATE_LIMIT_REQUESTS: int = 1
+    LLM_RATE_LIMIT_WINDOW_SECONDS: float = 20.0
+    LLM_RATE_LIMIT_MAX_BACKOFF_SECONDS: float = 30.0
 
     # Ollama (local)
     OLLAMA_BASE_URL: str = "http://localhost:11434"

@@ -161,6 +161,33 @@ def chunk_text(text: str) -> list[str]:
     return chunks or [text]
 
 
+def chunk_text_with_header(header: str, text: str) -> list[str]:
+    """Chunk a passage while reserving space for its repeated identity header."""
+    model = get_model()
+    tokenizer = model.tokenizer
+    header = (header or "").strip()
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    chunk_tokens, overlap_tokens = chunk_config()
+    header_ids = tokenizer.encode(header, add_special_tokens=False)
+    body_ids = tokenizer.encode(text, add_special_tokens=False)
+    body_budget = max(32, chunk_tokens - len(header_ids) - 2)
+    step = max(1, body_budget - min(overlap_tokens, body_budget // 3))
+    chunks: list[str] = []
+    for start in range(0, len(body_ids), step):
+        window = body_ids[start : start + body_budget]
+        if not window:
+            break
+        body = tokenizer.decode(window, skip_special_tokens=True).strip()
+        if body:
+            chunks.append(f"{header}\n\n{body}" if header else body)
+        if start + body_budget >= len(body_ids):
+            break
+    return chunks
+
+
 # ── Dense embedding ──────────────────────────────────────────────────────────
 
 
@@ -223,6 +250,7 @@ _sparse_lock = threading.Lock()
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 #: Named vector key used in Qdrant for the sparse arm.
 SPARSE_VECTOR_NAME = "sparse"
+INDEX_TEXT_FORMAT_VERSION = "self-describing-chunks-v2"
 DENSE_VECTOR_NAME = "dense"
 
 
@@ -342,7 +370,7 @@ def current_embed_signature() -> str:
     chunk_tokens, overlap_tokens = chunk_config()
     return (
         f"{settings.EMBEDDING_MODEL}|{SPARSE_MODEL_NAME}|"
-        f"{chunk_tokens}|{overlap_tokens}"
+        f"{chunk_tokens}|{overlap_tokens}|{INDEX_TEXT_FORMAT_VERSION}"
     )
 
 

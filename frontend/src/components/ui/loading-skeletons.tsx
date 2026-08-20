@@ -43,7 +43,9 @@ export function TableRowSkeleton({ columns = 5 }: { columns?: number }) {
     <tr className="border-b border-border">
       {Array.from({ length: columns }).map((_, i) => (
         <td key={i} className="py-3 px-3">
-          <Skeleton className={cn("h-4", i === 0 ? "w-48" : i === columns - 1 ? "w-16 ml-auto" : "w-20")} />
+          <Skeleton
+            className={cn("h-4", i === 0 ? "w-48" : i === columns - 1 ? "w-16 ml-auto" : "w-20")}
+          />
         </td>
       ))}
     </tr>
@@ -118,15 +120,15 @@ export function CardGridSkeleton({ count = 6 }: { count?: number }) {
 export function ChatMessageSkeleton({ isUser = false }: { isUser?: boolean }) {
   return (
     <div className={cn("flex gap-3", isUser ? "justify-end" : "justify-start")}>
-      {!isUser && (
-        <Skeleton className="h-8 w-8 rounded-lg shrink-0" />
-      )}
+      {!isUser && <Skeleton className="h-8 w-8 rounded-lg shrink-0" />}
       <div className={cn("max-w-[76%]", isUser && "order-1")}>
         <Skeleton className="h-3 w-16 mb-1" />
-        <div className={cn(
-          "rounded-2xl px-4 py-3",
-          isUser ? "bg-grad-brand" : "bg-card border border-border"
-        )}>
+        <div
+          className={cn(
+            "rounded-2xl px-4 py-3",
+            isUser ? "bg-grad-brand" : "bg-card border border-border",
+          )}
+        >
           <div className="space-y-2">
             <Skeleton className={cn("h-4 w-full", isUser ? "bg-white/30" : "")} />
             <Skeleton className={cn("h-4 w-5/6", isUser ? "bg-white/30" : "")} />
@@ -134,9 +136,7 @@ export function ChatMessageSkeleton({ isUser = false }: { isUser?: boolean }) {
           </div>
         </div>
       </div>
-      {isUser && (
-        <Skeleton className="h-8 w-8 rounded-lg shrink-0" />
-      )}
+      {isUser && <Skeleton className="h-8 w-8 rounded-lg shrink-0" />}
     </div>
   );
 }

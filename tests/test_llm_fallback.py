@@ -3,7 +3,13 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.config import LLMProvider
-from app.services.llm_client import AsyncLLMClient, _model_circuits, _model_probes
+from app.services.llm_client import (
+    AsyncLLMClient,
+    _capacity_retry_delay,
+    _model_circuits,
+    _model_probes,
+    _rate_limiters,
+)
 
 
 async def _collect(stream):
@@ -14,11 +20,18 @@ class LLMFallbackTests(unittest.TestCase):
     def setUp(self):
         _model_circuits.clear()
         _model_probes.clear()
+        _rate_limiters.clear()
+        self.rate_limit_patch = patch(
+            "app.services.llm_client.settings.LLM_RATE_LIMIT_WINDOW_SECONDS", 0
+        )
+        self.rate_limit_patch.start()
         self.client = AsyncLLMClient(provider=LLMProvider.openrouter)
 
     def tearDown(self):
+        self.rate_limit_patch.stop()
         _model_circuits.clear()
         _model_probes.clear()
+        _rate_limiters.clear()
 
     def test_capacity_error_falls_back(self):
         call = AsyncMock(
@@ -48,6 +61,17 @@ class LLMFallbackTests(unittest.TestCase):
             },
         )
         self.assertEqual([item.args[3] for item in call.await_args_list], ["primary/model", "fallback/model"])
+
+    def test_capacity_retry_honors_provider_retry_after(self):
+        error = RuntimeError("rate limit")
+        error.response = type("Response", (), {"headers": {"Retry-After": "7"}})()
+
+        with patch(
+            "app.services.llm_client.settings.LLM_RATE_LIMIT_WINDOW_SECONDS", 1
+        ), patch(
+            "app.services.llm_client.settings.LLM_RATE_LIMIT_MAX_BACKOFF_SECONDS", 30
+        ):
+            self.assertEqual(_capacity_retry_delay(error, 0), 7)
 
     def test_non_retryable_error_does_not_fall_back(self):
         call = AsyncMock(side_effect=ValueError("invalid request"))

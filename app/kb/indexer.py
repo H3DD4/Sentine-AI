@@ -47,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ingestion.embedder import (
     DENSE_VECTOR_NAME,
     SPARSE_VECTOR_NAME,
-    chunk_text,
+    chunk_text_with_header,
     content_hash,
     current_embed_signature,
     deterministic_qdrant_id,
@@ -204,6 +204,30 @@ def _doc_id_of(source: KBSource, row: Any) -> str:
     return str(getattr(row, source.pk_column.key))
 
 
+def _chunk_header(doc_id: str, payload: dict) -> str:
+    """Compact identity metadata repeated on every independently retrieved chunk."""
+    lines = [f"Document ID: {doc_id}"]
+    title = payload.get("title")
+    if title and str(title) != doc_id:
+        lines.append(f"Title: {title}")
+
+    severity = payload.get("severity")
+    cvss = payload.get("cvss_v3") or payload.get("cvss_score")
+    if severity or cvss:
+        value = f"Severity: {severity or 'unknown'}"
+        if cvss:
+            value += f"; CVSS: {cvss}"
+        lines.append(value)
+
+    cwe = payload.get("cwe")
+    if cwe:
+        lines.append(f"Weakness: {cwe}")
+    tactics = payload.get("tactics") or []
+    if tactics:
+        lines.append("Tactics: " + ", ".join(map(str, tactics)))
+    return "\n".join(lines)
+
+
 def _build_points(source: KBSource, row: Any, text: str) -> list[PointStruct]:
     """Chunk, embed (dense + sparse), and build one point per chunk."""
     return _build_points_batch(source, [(row, text)])[0][1]
@@ -223,15 +247,17 @@ def _build_points_batch(
     backfill, and changes nothing about the vectors produced.
     """
     flat_texts: list[str] = []
-    # (row, doc_id, chunk_texts, slice into flat_texts)
-    layout: list[tuple[Any, str, list[str], slice]] = []
+    # (row, doc_id, payload, chunk_texts, slice into flat_texts)
+    layout: list[tuple[Any, str, dict, list[str], slice]] = []
 
     for row, text in items:
         doc_id = _doc_id_of(source, row)
-        chunks = chunk_text(text)
+        base_payload = source.build_payload(row)
+        header = _chunk_header(doc_id, base_payload)
+        chunks = chunk_text_with_header(header, text)
         start = len(flat_texts)
         flat_texts.extend(chunks)
-        layout.append((row, doc_id, chunks, slice(start, len(flat_texts))))
+        layout.append((row, doc_id, base_payload, chunks, slice(start, len(flat_texts))))
 
     if not flat_texts:
         return [(row, []) for row, _ in items]
@@ -248,12 +274,11 @@ def _build_points_batch(
 
     results: list[tuple[Any, list[PointStruct]]] = []
 
-    for row, doc_id, chunks, span in layout:
+    for row, doc_id, base_payload, chunks, span in layout:
         if not chunks:
             results.append((row, []))
             continue
 
-        base_payload = source.build_payload(row)
         points: list[PointStruct] = []
         row_dense = dense_vecs[span]
         row_sparse = sparse_vecs[span]
@@ -446,6 +471,7 @@ async def reindex_source(
     *,
     force: bool = False,
     chunk_rows: int = 500,
+    batch_size: int = 128,
 ) -> IndexStats:
     """
     Re-index an entire source, streaming rows in windows so a large corpus
@@ -466,7 +492,9 @@ async def reindex_source(
         if not rows:
             break
 
-        s = await index_rows(source, session, qdrant, rows, force=force)
+        s = await index_rows(
+            source, session, qdrant, rows, force=force, batch_size=batch_size
+        )
         total.considered += s.considered
         total.indexed += s.indexed
         total.skipped_unchanged += s.skipped_unchanged

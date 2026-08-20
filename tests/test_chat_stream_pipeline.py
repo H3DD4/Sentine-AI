@@ -32,7 +32,7 @@ class ChatStreamPipelineTests(unittest.TestCase):
         ), patch(
             "app.routers.chat.SSE_KEEPALIVE_SECONDS", 0.0,
         ):
-            response = asyncio.run(chat_stream(request, session=object()))
+            response = asyncio.run(chat_stream(request, session=object(), user=None))
             content = asyncio.run(_collect(response))
 
         self.assertIn(": grounding pipeline active\n\n", content)
@@ -54,7 +54,7 @@ class ChatStreamPipelineTests(unittest.TestCase):
             "app.routers.chat.generate_conversational_response",
             side_effect=broken_response,
         ):
-            response = asyncio.run(chat_stream(request, session=object()))
+            response = asyncio.run(chat_stream(request, session=object(), user=None))
             content = asyncio.run(_collect(response))
 
         self.assertIn('"status": "error"', content)
@@ -82,7 +82,7 @@ class ChatStreamPipelineTests(unittest.TestCase):
             "app.routers.chat.generate_conversational_response",
             side_effect=selected_response,
         ):
-            response = asyncio.run(chat_stream(request, session=object()))
+            response = asyncio.run(chat_stream(request, session=object(), user=None))
             asyncio.run(_collect(response))
 
         self.assertEqual(received["model"], "selected/model")

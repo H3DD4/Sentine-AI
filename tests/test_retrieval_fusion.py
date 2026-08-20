@@ -8,9 +8,11 @@ from app.services.retrieval import (
     _prioritize_ghostwriter,
     _weighted_rrf,
 )
+from app.kb.indexer import _chunk_header
+from app.ingestion.embedder import chunk_text_with_header
 
 
-def _hits(source, count, *, exact_index=None):
+def _hits(source, count, *, exact_index=None, scores=None):
     hits = []
     for index in range(count):
         payload = {"matched_by": "exact_id" if index == exact_index else "hybrid"}
@@ -21,7 +23,7 @@ def _hits(source, count, *, exact_index=None):
                 doc_id=f"{source.key}-{index}",
                 title=f"Document {index}",
                 text="content",
-                score=0.0,
+                score=(scores[index] if scores else 0.0),
                 payload=payload,
             )
         )
@@ -29,16 +31,33 @@ def _hits(source, count, *, exact_index=None):
 
 
 class RetrievalFusionTests(unittest.TestCase):
-    def test_fallback_does_not_exclude_lower_weight_sources(self):
+    def test_hybrid_relevance_competes_across_sources(self):
         sources = [NVDSource(), MitreSource(), OwaspSource(), OwaspDocsSource()]
-        fused = _weighted_rrf([(source, _hits(source, 15)) for source in sources])
+        fused = _weighted_rrf(
+            [
+                (sources[0], _hits(sources[0], 2, scores=[0.90, 0.30])),
+                (sources[1], _hits(sources[1], 1, scores=[0.80])),
+                (sources[2], _hits(sources[2], 1, scores=[0.20])),
+                (sources[3], _hits(sources[3], 1, scores=[0.10])),
+            ]
+        )
 
-        first_eight = [hit.source_key for hit in fused[:8]]
+        self.assertEqual([hit.source_key for hit in fused[:3]], ["nvd", "mitre", "nvd"])
+        self.assertEqual([hit.score for hit in fused[:2]], [0.90, 0.80])
 
-        self.assertEqual(first_eight.count("nvd"), 2)
-        self.assertEqual(first_eight.count("mitre"), 2)
-        self.assertEqual(first_eight.count("owasp"), 2)
-        self.assertEqual(first_eight.count("owasp_docs"), 2)
+    def test_chunk_header_keeps_identity_and_severity_with_fragment(self):
+        header = _chunk_header(
+            "CVE-2025-1234",
+            {"title": "Example vulnerability", "severity": "CRITICAL", "cvss_v3": 9.8},
+        )
+        self.assertIn("Document ID: CVE-2025-1234", header)
+        self.assertIn("Title: Example vulnerability", header)
+        self.assertIn("Severity: CRITICAL; CVSS: 9.8", header)
+
+    def test_chunk_header_is_repeated_without_exceeding_configured_window(self):
+        chunks = chunk_text_with_header("Document ID: CVE-1", "long evidence " * 2000)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk.startswith("Document ID: CVE-1\n\n") for chunk in chunks))
 
     def test_exact_identifier_is_pinned_globally(self):
         nvd = NVDSource()

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 from app.kb.base import Availability, RetrievalHit, SearchOutcome, SourceReport
 from app.services.chat_grounding import (
     GroundedChatDraft,
+    _deterministic_fallback_draft,
     generate_structured_response,
     generate_conversational_response,
     parse_draft,
@@ -258,6 +259,9 @@ class StructuredChatGroundingTests(unittest.TestCase):
         self.assertEqual(
             client.generate_validation.await_args.kwargs["parse_attempts"], 1
         )
+        schema = client.generate_validation.await_args.kwargs["json_schema"]
+        self.assertIn("answer_markdown", schema["properties"])
+        self.assertIn("cvss", schema["properties"])
 
     def test_selected_model_is_used_for_draft_and_correction(self):
         unsafe = _draft(answer_markdown="T9999 proves impact.").model_dump(mode="json")
@@ -600,6 +604,77 @@ class StructuredChatGroundingTests(unittest.TestCase):
         self.assertIn("CVE-2022-23529", response)
         self.assertIn("safe fallback", " ".join(result.issues))
         self.assertIn("Knowledge sources used", response)
+
+    def test_malformed_completions_keep_deterministic_evidence_summary(self):
+        client = AsyncMock()
+        client.generate_validation = AsyncMock(side_effect=[
+            json.JSONDecodeError("invalid", "first", 0),
+            json.JSONDecodeError("invalid", "second", 0),
+        ])
+
+        response, _ = asyncio.run(generate_structured_response(
+            client,
+            [{"role": "user", "content": "The server fetched a metadata URL and returned a token after a timeout."}],
+            _outcome(),
+        ))
+
+        self.assertIn("Conservative analysis", response)
+        self.assertIn("SSRF mechanism", response)
+        self.assertIn("timeout", response)
+        self.assertIn("Pending evidence", response)
+
+    def test_provider_unavailability_returns_deterministic_summary(self):
+        client = AsyncMock()
+        client.generate_validation = AsyncMock(side_effect=RuntimeError(
+            "All configured models are temporarily unavailable"
+        ))
+
+        response, result = asyncio.run(generate_structured_response(
+            client,
+            [{"role": "user", "content": "The server fetched a metadata URL and returned a token after a timeout."}],
+            _outcome(),
+        ))
+
+        self.assertIn("Conservative analysis", response)
+        self.assertIn("SSRF mechanism", response)
+        self.assertIn("Pending evidence", response)
+        self.assertIn("provider was unavailable", " ".join(result.issues))
+        self.assertEqual(result.generation_status, "deterministic_fallback")
+
+    def test_command_injection_fallback_describes_supplied_command_output(self):
+        result = _deterministic_fallback_draft(
+            "The filename contains a shell metacharacter and the response contains uid=1001(app).",
+            SearchOutcome(
+                query="command injection",
+                hits=[],
+                reports=[],
+            ),
+            "provider unavailable",
+        )
+        self.assertIn("command injection", result.answer_markdown.lower())
+        self.assertIn("uid=1001(app)", result.answer_markdown.lower())
+        self.assertEqual(result.cvss.status, "pending_evidence")
+        self.assertEqual(result.cvss.vector, "")
+
+    def test_semantically_empty_model_draft_is_degraded_mode(self):
+        client = AsyncMock()
+        client.generate_validation = AsyncMock(return_value={
+            "answer_markdown": "",
+            "claims": [],
+            "mappings": [],
+            "cvss": {"status": "pending_evidence"},
+            "limitations": [],
+            "assumptions": [],
+        })
+
+        response, result = asyncio.run(generate_structured_response(
+            client,
+            [{"role": "user", "content": "The server fetched a metadata URL and returned a token after a timeout."}],
+            _outcome(),
+        ))
+
+        self.assertEqual(result.generation_status, "deterministic_fallback")
+        self.assertIn("Conservative analysis", response)
 
     def test_pipeline_stage_order_is_observable(self):
         client = AsyncMock()

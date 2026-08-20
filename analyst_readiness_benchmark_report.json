@@ -1,0 +1,197 @@
+{
+  "case_count": 5,
+  "passed": 5,
+  "failed": 0,
+  "pass_rate": 1.0,
+  "failure_categories": {
+    "model_or_validation": 0,
+    "transport_or_schema": 0,
+    "unsupported_identifier": 0,
+    "expectation_or_content": 0
+  },
+  "provider_unavailable": 0,
+  "production_decision": "CONDITIONAL_REVIEW_REQUIRED",
+  "results": [
+    {
+      "label": "ssrf_metadata.1",
+      "base": "ssrf_metadata",
+      "variant": 1,
+      "provider": {
+        "provider": "openai",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "primary_model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "fallback_used": false
+      },
+      "latency_ms": 67018.5,
+      "passed": true,
+      "checks": {
+        "nonempty": true,
+        "not_fallback": true,
+        "required_terms": true,
+        "no_score_when_forbidden": true,
+        "exact_cvss_when_required": true,
+        "no_unsupported_ids": true,
+        "grounding_not_unbounded": true
+      },
+      "unsupported_ids": [],
+      "grounding_issues": [
+        "Narrative contains an itemized CVSS vector; Python must render metric assignments from the validated structured CVSS assessment.",
+        "Proposed mappings lacked an exact authoritative retrieved record: CWE-918, API7:2023, T1003, A02:2025"
+      ],
+      "cvss_status": "pending_evidence",
+      "cvss_score": null,
+      "sources": [
+        "finding_templates",
+        "mitre",
+        "owasp",
+        "owasp_docs"
+      ],
+      "response": "## Constat : Server-Side Request Forgery (SSRF) vers un point de terminaison de métadonnées cloud\n\n### Titre\nExposition de jeton temporaire via SSRF sur un endpoint de métadonnées interne\n\n### Faits observés\n- Le testeur a modifié une URL de template côté serveur pour pointer vers un endpoint de métadonnées interne (ex. `http://169.254.169.254/latest/meta-data/iam/security-credentials/...`).\n- Le serveur a effectué la requête sortante vers cet endpoint.\n- Le document généré a contenu un jeton temporaire retourné par le service de métadonnées.\n\n### Déductions logiques\n- L'application ne valide pas ni ne restreint les URLs fournies par l'utilisateur avant d'effectuer des requêtes sortantes.\n- Le service de métadonnées cloud est accessible depuis l'hôte de l'application, ce qui permet la récupération de credentials temporaires (ex. rôle IAM EC2/SSM).\n- Ce comportement correspond à la définition de SSRF et au scénario d'attaque décrit dans l'OWASP API7:2023 [owasp_docs:98a1046e8e5427e879689414dc8ce28d].\n\n### Hypothèses (conditions non vérifiées)\n- Portée des permissions associées au rôle IAM exposé (lecture/écriture, ressources concernées).\n- Durée de validité du jeton temporaire et possibilité de renouvellement automatique.\n- Existence d'autres endpoints internes accessibles via le même vecteur (ex. user-data, configuration interne).\n- Absence de pare-feu sortant (egress filtering) ou de proxy restrictif côté serveur.\n\n### Inconnues\n- Impact métier réel selon les privilèges du rôle IAM compromis.\n- Présence de mécanismes de détection (WAF, SIEM) sur les requêtes vers 169.254.169.254.\n- Possibilité d'escalade de privilèges ou de mouvement latéral à partir de ce jeton.\n\n### Preuves\n- Requête manipulée par le testeur (URL du template remplacée par l'endpoint de métadonnées).\n- Réponse du service de métadonnées incluse dans le document généré (contenant le jeton).\n- Comportement reproductible : le serveur effectue systématiquement la requête sortante vers l'URL fournie.\n\n### Limitations\n- Le test s'est limité à la récupération du jeton ; aucune action n'a été tentée avec ce jeton (pas d'appel d'API AWS, pas d'escalade).\n- L'étendue exacte des permissions du rôle n'a pas été énumérée.\n- L'environnement réseau (VPC, security groups, IMDSv2) n'a pas été audité.\n\n### Remédiation\n1. **Validation stricte des URLs** : n'autoriser que les schémas (`https`), hôtes et ports attendus via une liste d'autorisation (allow-list).\n2. **Blocage des adresses privées/loopback** : rejeter toute URL résolvant vers `127.0.0.0/8`, `169.254.169.254`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `::1`, `fc00::/7` [owasp_docs:98a1046e8e5427e879689414dc8ce28d].\n3. **Désactiver les redirections HTTP** : empêcher le contournement via redirection vers une adresse interne.\n4. **Isolation réseau** : déployer un proxy sortant dédié avec règles de filtrage ; interdire l'accès direct au service de métadonnées depuis l'hôte applicatif si non requis.\n5. **Utiliser IMDSv2 (AWS)** : exiger un jeton de session pour accéder aux métadonnées, limitant l'exploitation SSRF.\n6. **Journalisation et alerting** : tracer les requêtes sortantes initiées par l'application, alerter sur les appels vers des CIDR privés ou l'IP de métadonnées.\n7. **Principes de moindre privilège** : restreindre les rôles IAM attachés aux instances au strict nécessaire.\n\n### Références contextuelles\n- OWASP API7:2023 Server Side Request Forgery — exemple d'exploitation vers métadonnées cloud et prévention [owasp_docs:98a1046e8e5427e879689414dc8ce28d].\n- Référence CWE correspondante citée dans [owasp_docs:98a1046e8e5427e879689414dc8ce28d].\n\n**Technical severity**\n- Pending evidence. Vector incomplet : manquants Attack Requirements (AT), Privileges Required (PR), User Interaction (UI), Confidentiality/Integrity/Availability impact (VC/VI/VA) selon les permissions réelles du rôle IAM et l'architecture réseau. Une évaluation exacte nécessite l'énumération des permissions du rôle et la confirmation de l'exploitabilité en conditions réelles.\n- Needed: VC (Confidentiality Impact) - dépend des permissions IAM réelles; VI (Integrity Impact) - dépend des permissions d'écriture du rôle; VA (Availability Impact) - dépend des permissions destructives (ex. termination, delete); SC/SI/SA (Subsequent System Impact) - dépend de la topologie cloud et du mouvement latéral possible\n\n**Conditional claims**\n- Le testeur a modifié l'URL du template côté serveur pour qu'elle pointe vers un endpoint de métadonnées interne (169.254.169.254) et le serveur a exécuté la requête sortante. _Evidence: no admissible evidence reference._ Conditions: No valid current-target evidence reference supports this claim level.\n- Le document généré a contenu un jeton temporaire retourné par l'endpoint de métadonnées. _Evidence: no admissible evidence reference._ Conditions: No valid current-target evidence reference supports this claim level.\n- L'application ne valide pas les URLs fournies par l'utilisateur avant d'effectuer des requêtes sortantes, permettant une SSRF vers le service de métadonnées cloud. _Evidence: KB2._ Conditions: No valid current-target evidence reference supports this claim level.\n- Le jeton temporaire exposé permet d'accéder aux ressources AWS autorisées pour le rôle IAM attaché à l'instance. _Evidence: KB2._ Conditions: Portée exacte des permissions du rôle IAM non vérifiée; Validité et durée de vie du jeton non confirmées; Aucune action n'a été tentée avec le jeton (ex. appel API AWS)\n- D'autres endpoints internes (user-data, configuration, autres services cloud) pourraient être accessibles via le même vecteur SSRF. _Evidence: KB2._ Conditions: Cartographie de la surface d'attaque interne non réalisée; Règles de pare-feu sortant (egress) non auditées\n\n**Limits and assumptions**\n- Test limité à la preuve de concept (récupération du jeton) ; aucune exploitation post-exploitation n'a été réalisée.\n- Permissions exactes du rôle IAM non énumérées (nécessite appel API AWS avec le jeton).\n- Configuration IMDS (v1 vs v2) non vérifiée ; IMDSv2 aurait pu bloquer l'exploitation.\n- Règles de pare-feu sortant (Security Groups, NACL, proxy) non auditées.\n- Absence de test de persistance (renouvellement du jeton, création de clés d'accès).\n- Impact métier non évalué (données sensibles, criticité des ressources accessibles).\n- L'endpoint de métadonnées est celui d'AWS (169.254.169.254) ; le comportement est similaire sur GCP/Azure (IP link-local).\n- Le jeton récupéré est un credential de sécurité IAM temporaire (AccessKeyId, SecretAccessKey, SessionToken).\n- L'application vulnérable est hébergée sur une instance/VM cloud avec un rôle IAM attaché.\n- Aucun WAF ou protection anti-SSRF n'a intercepté la requête lors du test.\n- Le template côté serveur accepte des URLs arbitraires sans validation préalable.\n\n**Grounding status**\n- Some generated proposals were rejected or conservatively rewritten by deterministic validation.\n\n_Knowledge sources used: Internal finding templates (3), MITRE ATT&CK (3), OWASP Top 10 (6), OWASP Official Guides (3)._"
+    },
+    {
+      "label": "ssrf_metadata.2",
+      "base": "ssrf_metadata",
+      "variant": 2,
+      "provider": {
+        "provider": "openai",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "primary_model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "fallback_used": false
+      },
+      "latency_ms": 72355.0,
+      "passed": true,
+      "checks": {
+        "nonempty": true,
+        "not_fallback": true,
+        "required_terms": true,
+        "no_score_when_forbidden": true,
+        "exact_cvss_when_required": true,
+        "no_unsupported_ids": true,
+        "grounding_not_unbounded": true
+      },
+      "unsupported_ids": [],
+      "grounding_issues": [
+        "Proposed mappings lacked an exact authoritative retrieved record: CWE-918, API7:2023, T1552.005",
+        "Correction did not improve deterministic validation; original draft retained."
+      ],
+      "cvss_status": "pending_evidence",
+      "cvss_score": null,
+      "sources": [
+        "finding_templates",
+        "mitre",
+        "owasp",
+        "owasp_docs"
+      ],
+      "response": "## Analyse de la vulnérabilité SSRF vers métadonnées cloud\n\n### Faits observés\n- Le testeur a modifié l'URL d'un template côté serveur pour pointer vers un endpoint de métadonnées interne (ex: `http://169.254.169.254/latest/meta-data/iam/security-credentials/...`).\n- Le serveur a effectué la requête sortante vers cet endpoint interne.\n- Le document généré contenait un jeton temporaire retourné par le service de métadonnées.\n\n### Déductions logiques\n- L'application ne valide pas ni ne restreint les URLs fournies par l'utilisateur avant d'effectuer la requête côté serveur (absence de liste d'autorisation, de blocage des plages d'adresses privées, ou de désactivation des redirections).\n- Le service de métadonnées cloud était accessible depuis le serveur d'application, ce qui confirme l'absence de segmentation réseau ou de pare-feu sortant restrictif.\n- La réponse brute du service interne est renvoyée au client dans le document généré, sans filtrage.\n\n### Hypothèses (non vérifiées)\n- Le jeton temporaire obtenu pourrait permettre d'accéder à d'autres ressources cloud (dépend des permissions attachées au rôle IAM associé).\n- D'autres endpoints internes (bases de données, API d'administration, etc.) pourraient être accessibles via le même vecteur.\n- L'exploitation pourrait être automatisée pour exfiltrer des métadonnées sensibles à grande échelle.\n\n### Inconnues / Preuves manquantes\n- Portée exacte des permissions du rôle IAM dont les identifiants ont été récupérés.\n- Présence ou non de WAF, de proxy sortant, ou de politiques IAM restrictives (condition `aws:SourceIp`, `aws:VpcSourceIp`).\n- Possibilité d'atteindre d'autres services internes (ex: `http://localhost`, `http://169.254.169.254/latest/user-data/`).\n- Durée de validité du jeton temporaire et mécanisme de rotation.\n- Impact business réel (accès aux données, pivot latéral, prise de contrôle de compte cloud).\n\n**Technical severity**\n- Pending evidence. The model proposed CVSS metrics that were not supplied in the analyst's current turn; metric applicability requires analyst review.\n- Needed: Confirm each CVSS metric with the analyst before assigning an exact score.\n\n**Conditional claims**\n- Le serveur effectue une requête sortante vers un endpoint de métadonnées cloud interne (169.254.169.254) suite à la manipulation d'un paramètre d'URL côté client. _Evidence: no admissible evidence reference._ Conditions: No valid current-target evidence reference supports this claim level.\n- L'application est vulnérable à une attaque SSRF (Server-Side Request Forgery) permettant d'atteindre le service de métadonnées d'instance cloud (IMDS). _Evidence: KB2._ Conditions: No valid current-target evidence reference supports this claim level.\n- Le jeton temporaire récupéré permet un accès non autorisé à des ressources cloud sensibles. _Evidence: KB2._ Conditions: Permissions réelles du rôle IAM associé à l'instance non vérifiées; Absence de conditions restrictives dans les politiques IAM (ex: aws:SourceIp, aws:VpcSourceIp) non confirmée; Validité et durée de vie du jeton non mesurées\n\n**Limits and assumptions**\n- Analyse basée uniquement sur la description textuelle fournie par l'utilisateur (TEXT1). Aucune capture de requête/réponse, configuration serveur, ou politique IAM n'a été fournie.\n- Aucun CVE spécifique n'est associé car il s'agit d'une classe de vulnérabilité (SSRF) et non d'un flaw dans un composant identifié.\n- L'endpoint de métadonnées est bien celui d'AWS (169.254.169.254) ; le même raisonnement s'applique à GCP (metadata.google.internal) ou Azure (169.254.169.254).\n- L'application utilise un parser/render de template côté serveur qui suit les redirections et supporte les schémas HTTP/HTTPS.\n- Le jeton temporaire est un identifiant de sécurité IAM AWS (AccessKeyId, SecretAccessKey, SessionToken).\n- Le testeur a agi dans le cadre d'un test autorisé ; aucune action malveillante n'est présumée.\n\n**Grounding status**\n- Some generated proposals were rejected or conservatively rewritten by deterministic validation.\n\n_Knowledge sources used: Internal finding templates (3), MITRE ATT&CK (3), OWASP Top 10 (6), OWASP Official Guides (3)._"
+    },
+    {
+      "label": "ssrf_metadata.3",
+      "base": "ssrf_metadata",
+      "variant": 3,
+      "provider": {
+        "provider": "openai",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "primary_model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "fallback_used": false
+      },
+      "latency_ms": 56803.5,
+      "passed": true,
+      "checks": {
+        "nonempty": true,
+        "not_fallback": true,
+        "required_terms": true,
+        "no_score_when_forbidden": true,
+        "exact_cvss_when_required": true,
+        "no_unsupported_ids": true,
+        "grounding_not_unbounded": true
+      },
+      "unsupported_ids": [],
+      "grounding_issues": [
+        "Proposed mappings lacked an exact authoritative retrieved record: CWE-918, API7:2023, T1003",
+        "Correction did not improve deterministic validation; original draft retained."
+      ],
+      "cvss_status": "pending_evidence",
+      "cvss_score": null,
+      "sources": [
+        "finding_templates",
+        "mitre",
+        "owasp",
+        "owasp_docs"
+      ],
+      "response": "L'incident décrit correspond à une faille de type **Server-Side Request Forgery (SSRF)** exploitant un service de métadonnées interne (cloud) pour récupérer un jeton temporaire.\n\n**Faits observés**\n- Le testeur a modifié un paramètre d'URL côté serveur (template) pour pointer vers un point de terminaison interne de métadonnées (ex. `http://169.254.169.254/latest/meta-data/...`).\n- Le serveur a effectué la requête sortante et a inclus la réponse (contenant un jeton temporaire) dans le document généré.\n\n**Déductions logiques**\n- L'application ne valide pas / ne restreint pas les URL fournies par l'utilisateur avant d'effectuer la requête côté serveur.\n- Le service de métadonnées interne est accessible depuis le serveur d'application, sans garde-fou (liste d'autorisation, blocage des plages d'adresses privées, désactivation des redirections).\n- La fuite du jeton temporaire permet potentiellement d'accéder aux ressources cloud associées au rôle de l'instance.\n\n**Hypothèses (non vérifiées)**\n- Étendue des permissions attachées au jeton (lecture seule, administration, accès à d'autres services).\n- Durée de validité du jeton et possibilité de le renouveler.\n- Présence d'autres points d'entrée SSRF dans l'application.\n- Existence de contrôles réseau (ex. IMDSv2 obligatoire, pare-feu sortant) qui limiteraient l'impact.\n\n**Inconnues**\n- Criticité métier des ressources accessibles via ce jeton.\n- Exploitation post-fuite (mouvement latéral, persistance, exfiltration).\n\nConcernant le **CVSS** : un score exact ne peut pas être produit sans connaître les métriques manquantes (portée, impact sur la confidentialité/intégrité/disponibilité, complexité d'attaque, privilèges requis, interaction utilisateur). Une fourchette ou un statut \"pending_evidence\" est plus approprié tant que ces éléments ne sont pas précisés.\n\n**Technical severity**\n- Pending evidence. Métriques manquantes critiques : Attack Vector (Network/Adjacent), Attack Complexity, Privileges Required, User Interaction, Scope (Changed/Unchanged), Confidentiality/Integrity/Availability Impact. Impossible de proposer une fourchette fiable sans ces informations.\n- Needed: AV (Attack Vector); AC (Attack Complexity); PR (Privileges Required); UI (User Interaction); S (Scope); C (Confidentiality Impact); I (Integrity Impact); A (Availability Impact)\n\n**Conditional claims**\n- Le testeur a modifié un paramètre d'URL côté serveur vers un point de terminaison interne de métadonnées cloud et le serveur a retourné la réponse contenant un jeton temporaire dans le document généré. _Evidence: no admissible evidence reference._ Conditions: No valid current-target evidence reference supports this claim level.\n- L'application est vulnérable à une attaque SSRF permettant d'accéder à des ressources internes (service de métadonnées cloud) via une URL fournie par l'utilisateur. _Evidence: KB2._ Conditions: No valid current-target evidence reference supports this claim level.\n- Le jeton temporaire obtenu permet d'accéder à des ressources cloud sensibles selon les permissions du rôle d'instance associé. _Evidence: KB2._ Conditions: Permissions réelles attachées au rôle d'instance non vérifiées; Durée de validité du jeton non connue; Politiques IAM / garde-fous réseau (IMDSv2, pare-feu sortant) non confirmés\n\n**Limits and assumptions**\n- Aucune preuve technique directe (logs, captures réseau, code) fournie pour le cas courant — seule la description utilisateur.\n- Contexte cloud (AWS/GCP/Azure), configuration IMDS (v1/v2), et politiques IAM inconnus.\n- Aucune information sur l'étendue de l'application vulnérable (un endpoint, plusieurs, pré/post-auth).\n- Le service de métadonnées ciblé est bien celui d'un fournisseur cloud standard (ex. AWS IMDS à 169.254.169.254).\n- Le jeton temporaire est un credential valide (ex. AWS STS token, GCP access token).\n- L'application vulnérable effectue le rendu côté serveur (SSR) ou génération de document (PDF, rapport) incluant la réponse brute.\n\n**Grounding status**\n- Some generated proposals were rejected or conservatively rewritten by deterministic validation.\n\n_Knowledge sources used: Internal finding templates (3), MITRE ATT&CK (3), OWASP Top 10 (6), OWASP Official Guides (3)._"
+    },
+    {
+      "label": "ssrf_metadata.4",
+      "base": "ssrf_metadata",
+      "variant": 4,
+      "provider": {
+        "provider": "openai",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "primary_model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "fallback_used": false
+      },
+      "latency_ms": 147168.1,
+      "passed": true,
+      "checks": {
+        "nonempty": true,
+        "not_fallback": true,
+        "required_terms": true,
+        "no_score_when_forbidden": true,
+        "exact_cvss_when_required": true,
+        "no_unsupported_ids": true,
+        "grounding_not_unbounded": true
+      },
+      "unsupported_ids": [],
+      "grounding_issues": [
+        "Proposed mappings lacked an exact authoritative retrieved record: API7:2023, CWE-918",
+        "Correction did not improve deterministic validation; original draft retained."
+      ],
+      "cvss_status": "pending_evidence",
+      "cvss_score": null,
+      "sources": [
+        "finding_templates",
+        "mitre",
+        "owasp",
+        "owasp_docs"
+      ],
+      "response": "## Analyse de la trouvaille : SSRF vers métadonnées cloud\n\n### Faits observés\n- Le testeur a modifié une URL de template côté serveur pour pointer vers un endpoint de métadonnées interne (ex: `http://169.254.169.254/latest/meta-data/iam/security-credentials/...`).\n- Le serveur a effectué la requête sortante vers cet endpoint.\n- Le document généré contenait un jeton temporaire (identifiants cloud) retourné par le service de métadonnées.\n\n### Déductions logiques\n- L'application traite des URLs fournies par l'utilisateur sans validation adéquate de la destination (allow-list, blocage des plages d'adresses privées/locales).\n- Le service de métadonnées cloud est accessible depuis l'hôte applicatif, ce qui est la configuration par défaut sur AWS/GCP/Azure.\n- La réponse brute du service de métadonnées est réinjectée dans le document généré côté serveur, exposant les secrets au testeur.\n\n### Hypothèses (non vérifiées)\n- L'endpoint de métadonnées ciblé est bien celui d'un fournisseur cloud (AWS IMDSv1/v2, GCP, Azure).\n- Le jeton obtenu permet d'accéder à d'autres ressources cloud (rôle IAM attaché à l'instance).\n- L'application n'utilise pas de proxy sortant restrictif ou de pare-feu bloquant l'accès à `169.254.169.254`.\n\n### Inconnues\n- Portée exacte des permissions associées au rôle IAM récupéré.\n- Présence ou non de mitigations partielles (ex: IMDSv2 obligatoire, hop-limit, en-têtes requis).\n- Si d'autres endpoints internes sont accessibles via le même vecteur.\n\n### Recommandations (bonnes pratiques OWASP)\n- Isoler le mécanisme de récupération de ressources : n'autoriser que des origines distantes attendues (allow-list de domaines, schémas, ports).\n- Bloquer les redirections HTTP.\n- Utiliser un parseur d'URL robuste et tester les incohérences de parsing.\n- Ne jamais renvoyer la réponse brute au client.\n- Au niveau infrastructure : exiger IMDSv2, mettre un hop-limit à 1, ou désactiver l'accès aux métadonnées si non utilisé.\n\n**Références contextuelles** : OWASP API7:2023 SSRF décrit exactement ce scénario avec un endpoint de métadonnées cloud [owasp_docs:98a1046e8e5427e879689414dc8ce28d].\n\n**Technical severity**\n- Pending evidence. Vector incomplet : il manque les métriques d'attaque (AV, AC, AT, PR, UI), d'impact (VC, VI, VA), et de scope (SC, SI, SA). L'exploitabilité dépend de conditions non vérifiées (IMDSv2, hop-limit, permissions du rôle).\n- Needed: AV (Attack Vector); AC (Attack Complexity); AT (Attack Requirements); PR (Privileges Required); UI (User Interaction); VC (Confidentiality Impact); VI (Integrity Impact); VA (Availability Impact); SC (Subsequent System Confidentiality); SI (Subsequent System Integrity); SA (Subsequent System Availability)\n\n**Observed claims**\n- Le testeur a modifié une URL de template côté serveur vers un endpoint de métadonnées interne et le serveur a effectué la requête sortante. _Evidence: FINDING1._\n- Le document généré contenait un jeton temporaire retourné par le service de métadonnées. _Evidence: FINDING1._\n\n**Logically demonstrated claims**\n- L'application est vulnérable à une SSRF (Server-Side Request Forgery) permettant d'atteindre le service de métadonnées cloud. _Evidence: FINDING1._\n\n**Conditional claims**\n- Le jeton obtenu permet un accès authentifié aux API cloud avec les privilèges du rôle d'instance. _Evidence: KB2._ Conditions: Le endpoint ciblé est bien un service de métadonnées cloud standard; Le rôle IAM attaché à l'instance a des permissions effectives; Aucune restriction IMDSv2 / hop-limit / en-têtes requis n'est en place\n\n**Limits and assumptions**\n- Aucune preuve technique brute fournie (requête/réponse HTTP, captures d'écran, logs).\n- L'endpoint exact de métadonnées n'est pas confirmé (AWS vs GCP vs Azure).\n- La version de l'API de métadonnées (IMDSv1 vs IMDSv2) est inconnue.\n- Les permissions effectives du rôle IAM récupéré ne sont pas connues.\n- L'architecture réseau (proxy, pare-feu, VPC) n'est pas documentée.\n- L'endpoint `169.254.169.254` est le service de métadonnées AWS (hypothèse forte basée sur KB2).\n- L'application génère des documents côté serveur à partir de templates URL fournis par l'utilisateur.\n- Aucun WAF / proxy sortant ne filtre les requêtes vers les plages link-local.\n- Le jeton est un credential AWS STS temporaire (AccessKeyId, SecretAccessKey, SessionToken).\n\n**Grounding status**\n- Some generated proposals were rejected or conservatively rewritten by deterministic validation.\n\n_Knowledge sources used: Internal finding templates (3), MITRE ATT&CK (3), OWASP Top 10 (6), OWASP Official Guides (3)._"
+    },
+    {
+      "label": "ssrf_metadata.5",
+      "base": "ssrf_metadata",
+      "variant": 5,
+      "provider": {
+        "provider": "openai",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "primary_model": "nvidia/nemotron-3-ultra-550b-a55b",
+        "fallback_used": false
+      },
+      "latency_ms": 141261.8,
+      "passed": true,
+      "checks": {
+        "nonempty": true,
+        "not_fallback": true,
+        "required_terms": true,
+        "no_score_when_forbidden": true,
+        "exact_cvss_when_required": true,
+        "no_unsupported_ids": true,
+        "grounding_not_unbounded": true
+      },
+      "unsupported_ids": [],
+      "grounding_issues": [
+        "Narrative contains a model-authored CVSS score; Python must render scores from the validated structured CVSS assessment.",
+        "Narrative contains an itemized CVSS vector; Python must render metric assignments from the validated structured CVSS assessment.",
+        "Proposed mappings lacked an exact authoritative retrieved record: CWE-918, API7:2023, A02:2025"
+      ],
+      "cvss_status": "pending_evidence",
+      "cvss_score": null,
+      "sources": [
+        "finding_templates",
+        "mitre",
+        "owasp",
+        "owasp_docs"
+      ],
+      "response": "## Analyse critique du rapport SSRF\n\n### Faits observés\n- Le testeur a modifié un paramètre d'URL côté serveur (template) pour pointer vers un endpoint de métadonnées interne (ex: `http://169.254.169.254/...`).\n- Le serveur a effectué la requête sortante vers cet endpoint.\n- Le document généré contenait un jeton temporaire retourné par l'endpoint de métadonnées.\n\n### Déductions logiques\n- L'application ne valide pas ou ne restreint pas les URLs fournies par l'utilisateur avant d'effectuer des requêtes côté serveur → **SSRF confirmé**.\n- L'endpoint de métadonnées cloud est accessible depuis le serveur d'application, ce qui indique une absence de segmentation réseau ou de blocage des plages IP réservées (169.254.169.254/32, 169.254.170.2/32, etc.).\n- La réponse brute de la requête SSRF est incluse dans le document généré et renvoyée à l'attaquant → **fuite de données sensibles**.\n\n### Hypothèses (non vérifiées)\n- Le jeton temporaire permet d'accéder à d'autres ressources cloud (ex: buckets S3, bases de données, APIs internes).\n- Le rôle IAM associé au jeton a des privilèges étendus (ex: `AdministratorAccess`, `PowerUserAccess`).\n- L'attaquant peut pivoter vers d'autres services internes via ce SSRF (ex: accès à des interfaces d'admin non exposées).\n- Le SSRF est exploitable en aveugle (sans retour de la réponse) sur d'autres endpoints.\n\n### Inconnues / Preuves manquantes\n- Étendue réelle des permissions du rôle IAM récupéré (nécessite test d'utilisation du jeton).\n- Présence de WAF, proxy sortant, ou IMDSv2 (exigence de header `X-aws-ec2-metadata-token`) qui pourrait limiter l'exploitation.\n- Possibilité d'exfiltrer d'autres secrets via le même vecteur (clés API, variables d'environnement, etc.).\n- Impact business réel : données accessibles, conformité réglementaire, criticité des assets exposés.\n\n### Sur-revendications (overclaims) à rejeter ou conditionner\n| Revendication | Statut | Justification |\n|---|---|---|\n| \"Compromission totale du compte cloud\" | **Rejetée** | Aucun test d'utilisation du jeton, permissions inconnues. |\n| \"Accès aux données clients / production\" | **Non prouvée** | Aucune preuve d'accès à des ressources de données réelles. |\n| \"Mouvement latéral garanti\" | **Spéculative** | Dépend de l'architecture réseau, des groupes de sécurité, du moindre privilège. |\n|\n| \"Contournement IMDSv2\" | **Non testé** | Aucune tentative avec header de session IMDSv2 rapportée. |\n\n### Recommandations pour le rapport final\n1. Qualifier le finding : **SSRF vers metadata cloud avec fuite de jeton temporaire** ([owasp_docs:98a1046e8e5427e879689414dc8ce28d], [owasp:A02_2025]).\n2. Ne pas scorer CVSS sans vector complet ; fournir une fourchette conditionnelle avec assumptions explicites.\n3. Documenter ce qui a été *prouvé* (requête sortante, jeton dans réponse) vs ce qui est *possible* (utilisation du jeton, pivot).\n4. Tester l'utilisation effective du jeton (si scope le permet) pour valider l'impact.\n5. Vérifier IMDSv2, politiques IAM, et segmentation réseau comme facteurs atténuants.\n6. Citer les références : [owasp_docs:98a1046e8e5427e879689414dc8ce28d] pour le pattern d'exploitation SSRF vers metadata, [owasp:A02_2025] pour Security Misconfiguration (défaut de restriction sortante).\n\n**Technical severity**\n- Pending evidence. The model proposed CVSS metrics that were not supplied in the analyst's current turn; metric applicability requires analyst review.\n- Needed: Confirm each CVSS metric with the analyst before assigning an exact score.\n\n**Conditional claims**\n- The tester changed a server-side template URL to an internal cloud metadata endpoint (169.254.169.254), the server made the outbound request, and the generated document contained a temporary token from that endpoint. _Evidence: no admissible evidence reference._ Conditions: No valid current-target evidence reference supports this claim level.\n- The application is vulnerable to Server-Side Request Forgery (SSRF) because it fetches user-supplied URLs without validation or allow-listing, and returns the raw response to the user. _Evidence: KB2._ Conditions: No valid current-target evidence reference supports this claim level.\n- The leaked temporary token grants access to cloud resources and enables lateral movement within the cloud environment. _Evidence: KB2._ Conditions: Token has not been used to call any cloud APIs (unverified usability).; IAM role permissions attached to the instance/profile are unknown (unverified scope).; IMDSv2 may require a session token header, which was not tested (unverified mitigation).; Network egress controls or SCPs may restrict what the credentials can access (unverified environment).\n\n**Limits and assumptions**\n- No evidence of token usage or validation of its permissions (scope, duration, policies).\n- IMDSv2 enforcement not tested; may require session token header blocking simple SSRF.\n- Network egress controls, SCPs, permission boundaries unknown.\n- Business impact (data classification, regulatory scope) not assessed.\n- Single observation; no evidence of persistence, automation, or exploit reliability.\n- Cloud provider is AWS (169.254.169.254 is AWS IMDS endpoint); other clouds use same IP.\n- Token is an IAM role temporary credential (standard for cloud metadata services).\n- Application runs on a compute instance with an attached instance profile/role.\n- SSRF vector is reproducible and not a one-time fluke.\n- Attacker can control the template URL parameter reliably.\n\n**Grounding status**\n- Some generated proposals were rejected or conservatively rewritten by deterministic validation.\n\n_Knowledge sources used: Internal finding templates (3), MITRE ATT&CK (3), OWASP Top 10 (6), OWASP Official Guides (3)._"
+    }
+  ]
+}

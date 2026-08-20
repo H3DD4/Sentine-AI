@@ -358,6 +358,7 @@ class ChatRequest(BaseModel):
     action: Optional[str] = None
     title: Optional[str] = None
     model: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 class ConversationState(BaseModel):
     title: Optional[str] = None
@@ -373,6 +374,7 @@ class ConversationOut(BaseModel):
     validation_snapshot: Optional[dict] = None
     readiness_snapshot: Optional[dict] = None
     finding_id: Optional[str] = None
+    retrieval_workspace: Optional[dict] = None
     created_at: datetime
     updated_at: datetime
     class Config:
@@ -551,8 +553,8 @@ class SettingsOut(BaseModel):
     together_validation_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
     together_vision_model: str = "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo"
 
-    openrouter_chat_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    openrouter_validation_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    openrouter_chat_model: str = "z-ai/glm-5.2:free"
+    openrouter_validation_model: str = "z-ai/glm-5.2:free"
     openrouter_vision_model: str = "microsoft/phi-3-vision-128k-instruct:free"
     openrouter_chat_fallback_models: List[str] = []
     openrouter_validation_fallback_models: List[str] = []

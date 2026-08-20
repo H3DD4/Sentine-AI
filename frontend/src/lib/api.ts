@@ -555,6 +555,7 @@ export function streamChatMessage(
   onGeneration?: (generation: GenerationInfo) => void,
   model?: string,
   onStage?: (stage: StreamStage) => void,
+  conversationId?: string,
 ): () => void {
   const controller = new AbortController();
   let manuallyAborted = false;
@@ -583,7 +584,12 @@ export function streamChatMessage(
       const res = await apiFetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages, finding_id: findingId, model }),
+        body: JSON.stringify({
+          messages,
+          finding_id: findingId,
+          model,
+          conversation_id: conversationId,
+        }),
         signal: controller.signal,
       });
 
@@ -687,12 +693,7 @@ export async function refineFindingImpact(
   context: string,
   signal?: AbortSignal,
 ): Promise<ValidationResponse> {
-  return request<ValidationResponse>(
-    "POST",
-    `/validate/${findingId}/impact`,
-    { context },
-    signal,
-  );
+  return request<ValidationResponse>("POST", `/validate/${findingId}/impact`, { context }, signal);
 }
 
 // ─── Findings ─────────────────────────────────────────────────────────
@@ -928,9 +929,7 @@ export async function getConversation(id: string): Promise<AnalysisConversation>
   return request<AnalysisConversation>("GET", `/conversations/${id}`);
 }
 
-type ConversationState = Partial<
-  Omit<AnalysisConversation, "id" | "created_at" | "updated_at">
->;
+type ConversationState = Partial<Omit<AnalysisConversation, "id" | "created_at" | "updated_at">>;
 
 export async function createConversation(state: ConversationState): Promise<AnalysisConversation> {
   return request<AnalysisConversation>("POST", "/conversations", state);

@@ -38,6 +38,11 @@ _LEAKED_PLACEHOLDER = re.compile(
     r"unsupported local citation removed)\]",
     re.IGNORECASE,
 )
+_MODEL_CVSS_RANGE = re.compile(
+    r"(?i)\b(?:lower\s+bound|upper\s+bound|borne\s+(?:inf[eé]rieure|sup[eé]rieure)|"
+    r"statut\s*[:=-]?\s*`?range|status\s*[:=-]?\s*`?range|"
+    r"technical\s+severity\s+range)\b"
+)
 _INLINE_CVSS_SCORE = re.compile(
     r"(?i)(?:"
     r"(?:cvss(?:\s*v?3\.1|\s*v?4\.0)?|score(?:\s+de\s+base|\s+technique)?|"
@@ -99,12 +104,26 @@ class ProposedCVSSScenario(BaseModel):
 class ProposedCVSSAssessment(BaseModel):
     model_config = ConfigDict(extra="ignore")
     status: Literal["exact", "range", "pending_evidence", "not_applicable"] = "pending_evidence"
-    version: Literal["4.0", "3.1", ""] = ""
-    vector: str = ""
+    version: Literal["4.0", "3.1", ""] | None = ""
+    vector: str | None = ""
     rationale: str = ""
     lower_bound: ProposedCVSSScenario | None = None
     upper_bound: ProposedCVSSScenario | None = None
     unresolved_metrics: list[str] = Field(default_factory=list)
+
+
+class ProposedSecurityMapping(BaseModel):
+    """Permissive model-output shape; validation owns admissibility later."""
+
+    model_config = ConfigDict(extra="ignore")
+    mapping_type: str = ""
+    identifier: str = ""
+    name: str = ""
+    applicability: str = "unsupported"
+    rationale: str = ""
+    evidence_basis: str = ""
+    source: str = ""
+    source_doc_id: str = ""
 
 
 class GroundedChatDraft(BaseModel):
@@ -112,7 +131,7 @@ class GroundedChatDraft(BaseModel):
 
     answer_markdown: str = ""
     claims: list[ImpactClaim] = Field(default_factory=list)
-    mappings: list[SecurityMapping] = Field(default_factory=list)
+    mappings: list[ProposedSecurityMapping] = Field(default_factory=list)
     cvss: ProposedCVSSAssessment = Field(default_factory=ProposedCVSSAssessment)
     limitations: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -137,6 +156,7 @@ class GroundingResult:
     valid_kb_references: list[int] = field(default_factory=list)
     requested_identifiers: list[str] = field(default_factory=list)
     itemized_cvss: bool = False
+    generation_status: Literal["model", "corrected_model", "deterministic_fallback"] = "model"
 
 
 CHAT_DRAFT_SYSTEM = """You are drafting a grounded cybersecurity answer for a red-team analyst.
@@ -262,6 +282,77 @@ def _empty_draft(reason: str) -> GroundedChatDraft:
     )
 
 
+def _deterministic_fallback_draft(
+    user_text: str, outcome: SearchOutcome, reason: str
+) -> GroundedChatDraft:
+    """Produce useful, non-authoritative output when every model draft fails."""
+    text = user_text.lower()
+    retrieved = " ".join(hit.text.lower() for hit in outcome.hits)
+    evidence = f"{text} {retrieved}"
+    french = bool(re.search(r"\b(?:tu|une|avec|preuve|port[eé]e|jeton)\b", text))
+    ssrf = (
+        "ssrf" in evidence
+        or "server side request forgery" in evidence
+        or ("metadata" in evidence and "server" in evidence and "url" in evidence)
+    )
+    command_injection = (
+        "command injection" in evidence
+        or "os command" in evidence
+        or "operating-system command" in evidence
+        or ("shell metacharacter" in evidence and ("uid=" in text or "gid=" in text))
+    )
+    command_output = " ".join(dict.fromkeys(
+        match.group(0) for match in re.finditer(
+            r"\b(?:uid|gid)=\d+(?:\([^\r\n)]{1,80}\))?", user_text, re.IGNORECASE
+        )
+    ))
+    timeout = "timeout" in text or "time out" in text
+    mechanism = (
+        f"Le matériel fourni contient la sortie {command_output}, cohérente avec l'exécution d'une commande système via le paramètre testé."
+        if french and command_injection and command_output else
+        f"The supplied material contains {command_output}, consistent with OS command injection through the tested parameter."
+        if command_injection and command_output else
+        "Le contexte récupéré contient une référence à un mécanisme d'injection de commande système."
+        if french and command_injection else
+        "The retrieved context contains a reference to an OS command injection mechanism."
+        if command_injection else
+        "Le contexte récupéré contient une référence au mécanisme SSRF."
+        if french and ssrf else
+        "Retrieved context contains a reference to the SSRF mechanism."
+        if ssrf else
+        "The retrieved context does not establish an exact vulnerability mechanism."
+    )
+    contradiction = (
+        "Une contradiction ou un résultat de timeout doit rester non résolu et être vérifié dans le même environnement."
+        if french and timeout else
+        "A contradictory or timeout result remains unresolved and must be verified in the same environment."
+        if timeout else "No cross-run contradiction was deterministically established."
+    )
+    missing = (
+        "Les métriques CVSS, l'impact et les correspondances autoritatives restent à confirmer par des preuves."
+        if french else
+        "CVSS metrics, impact, and authoritative mappings remain to be confirmed with evidence."
+    )
+    heading = "Analyse conservatrice" if french else "Conservative analysis"
+    answer = (
+        f"## {heading}\n\n"
+        + ("Le modèle n'a pas fourni de brouillon structuré valide. Le système conserve uniquement les faits contrôlables.\n\n" if french
+           else "The model did not provide a valid structured draft. The system retains only mechanically supportable facts.\n\n")
+        + mechanism + "\n\n"
+        + contradiction + "\n\n"
+        + missing
+    )
+    return GroundedChatDraft(
+        answer_markdown=answer,
+        cvss=ProposedCVSSAssessment(
+            status="pending_evidence",
+            rationale=missing,
+            unresolved_metrics=["Analyst confirmation required before scoring."],
+        ),
+        limitations=[reason],
+    )
+
+
 def parse_draft(data: dict) -> tuple[GroundedChatDraft, list[str]]:
     """Parse model JSON without guessing missing nested values."""
     try:
@@ -271,6 +362,16 @@ def parse_draft(data: dict) -> tuple[GroundedChatDraft, list[str]]:
             f"Structured draft schema error: {error['loc']}: {error['msg']}"
             for error in exc.errors()[:12]
         ]
+
+
+def _draft_is_substantively_empty(draft: ValidatedChatDraft) -> bool:
+    return not any((
+        draft.answer_markdown.strip(),
+        draft.claims,
+        draft.mappings,
+        draft.limitations,
+        draft.assumptions,
+    ))
 
 
 def _normalize_draft(
@@ -534,6 +635,7 @@ def _unsafe_model_fragment(value: str) -> bool:
         or _INLINE_CVSS_SCORE.search(value)
         or _INLINE_SEVERITY_LABEL.search(value)
         or _LEAKED_PLACEHOLDER.search(value)
+        or _MODEL_CVSS_RANGE.search(value)
         or _KB_REFERENCE.search(value)
     )
 
@@ -835,16 +937,38 @@ async def generate_structured_response(
             max_tokens=5000,
             model=model,
             parse_attempts=1,
+            json_schema=GroundedChatDraft.model_json_schema(),
         )
         draft, parse_issues = parse_draft(raw)
-    except json.JSONDecodeError:
-        # A malformed completion is a correctable model-output defect, not a
-        # transport failure. Do not expose or re-parse the invalid prose.
-        raw = {"status": "unparseable structured draft"}
-        draft = _empty_draft(
+    except Exception as exc:
+        # Model formatting and provider availability are both recoverable at
+        # the system boundary. Do not expose invalid prose or make correctness
+        # depend on one provider being reachable.
+        malformed = isinstance(exc, json.JSONDecodeError)
+        raw = {
+            "status": (
+                "unparseable structured draft" if malformed
+                else "structured model unavailable"
+            )
+        }
+        reason = (
             "The first model draft was not valid JSON and could not be trusted."
+            if malformed else
+            f"The model provider was unavailable ({type(exc).__name__}); deterministic fallback retained."
         )
-        parse_issues = ["The first model draft was not valid JSON."]
+        draft = _deterministic_fallback_draft(
+            user_text,
+            outcome,
+            reason,
+        )
+        parse_issues = [
+            "The first model draft was not valid JSON."
+            if malformed else
+            f"The model provider was unavailable ({type(exc).__name__})."
+        ]
+        used_deterministic_fallback = True
+    else:
+        used_deterministic_fallback = False
     if stage:
         await stage("draft", "Drafting analysis", "complete", "Structured draft received")
         await stage("validate", "Validating facts", "active", "Checking citations, mappings, evidence and CVSS")
@@ -856,6 +980,25 @@ async def generate_structured_response(
         image_evidence_count=image_evidence_count,
     )
     result.issues = list(dict.fromkeys([*parse_issues, *result.issues]))
+    if used_deterministic_fallback:
+        result.generation_status = "deterministic_fallback"
+    elif _draft_is_substantively_empty(result.draft):
+        result.draft = _normalize_draft(
+            _deterministic_fallback_draft(
+                user_text,
+                outcome,
+                "The model returned a structurally valid but substantively empty draft.",
+            ),
+            outcome,
+            user_text=user_text,
+            text_evidence_count=text_evidence_count,
+            image_evidence_count=image_evidence_count,
+        )
+        result.issues = list(dict.fromkeys([
+            *result.issues,
+            "The model draft did not meet the minimum useful-content requirement.",
+        ]))
+        result.generation_status = "deterministic_fallback"
     if stage:
         await stage(
             "validate", "Validating facts", "complete",
@@ -878,6 +1021,7 @@ async def generate_structured_response(
                 max_tokens=5000,
                 model=model,
                 parse_attempts=1,
+                json_schema=GroundedChatDraft.model_json_schema(),
             )
             revised, revised_parse_issues = parse_draft(revised_raw)
             revised_result = validate_draft(
@@ -894,7 +1038,9 @@ async def generate_structured_response(
                 revised_result.draft.answer_markdown.strip()
                 and len(revised_result.issues) < len(result.issues)
             ):
-                result = revised_result
+                if not _draft_is_substantively_empty(revised_result.draft):
+                    result = revised_result
+                    result.generation_status = "corrected_model"
             else:
                 result.issues = list(dict.fromkeys([
                     *result.issues,
@@ -908,6 +1054,18 @@ async def generate_structured_response(
                 *result.issues,
                 f"Correction failed ({type(exc).__name__}); original safe fallback retained.",
             ]))
+            if not result.draft.answer_markdown.strip():
+                result.draft = _normalize_draft(
+                    _deterministic_fallback_draft(
+                        user_text,
+                        outcome,
+                        "The correction response was unavailable; deterministic fallback retained.",
+                    ),
+                    outcome,
+                    user_text=user_text,
+                    text_evidence_count=text_evidence_count,
+                    image_evidence_count=image_evidence_count,
+                )
         result.corrected = True
         if stage:
             await stage(

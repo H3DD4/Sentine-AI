@@ -46,6 +46,9 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(result.finding_id, "finding-1")
         session.commit.assert_awaited_once()
 
+    def test_client_cannot_overwrite_retrieval_workspace(self):
+        self.assertNotIn("retrieval_workspace", ConversationState.model_fields)
+
 
 if __name__ == "__main__":
     unittest.main()

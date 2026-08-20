@@ -23,6 +23,7 @@ class AnalysisConversation(Base):
     messages = Column(JSON, default=list, nullable=False)
     validation_snapshot = Column(JSON, nullable=True)
     readiness_snapshot = Column(JSON, nullable=True)
+    retrieval_workspace = Column(JSON, nullable=True)
     finding_id = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False, index=True)

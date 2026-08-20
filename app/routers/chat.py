@@ -10,6 +10,8 @@ POST /chat/stream         → Server-Sent Events (pure conversation, no validati
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.auth import get_current_active_user
 from app.db import get_session
 from app.kb.base import SearchOutcome
 from app.schemas import ChatRequest, ChatMessage, ValidationResult
@@ -25,6 +27,16 @@ from app.services.upload_processing import (
 )
 from app.services.report import generate_report_docx
 from app.models import Finding, Evidence, Engagement
+from app.models import AnalysisConversation, User
+from app.services.retrieval_cache import (
+    acquire_lock,
+    current_index_revision,
+    get_async as get_cached_retrieval,
+    put_async as put_cached_retrieval,
+    release_lock,
+    retrieval_cache_key,
+    workspace_update,
+)
 import json
 import io
 import logging
@@ -61,18 +73,69 @@ def _social_reply(query: str) -> str | None:
 
 
 async def _conversation_outcome(
-    query: str, prior_turns: list[str], session: AsyncSession
+    query: str,
+    prior_turns: list[str],
+    session: AsyncSession,
+    *,
+    user_id: str | None = None,
+    conversation: AnalysisConversation | None = None,
 ) -> SearchOutcome:
     if not _needs_retrieval(query):
         return SearchOutcome(query=query)
     retrieval_query = query
     if prior_turns:
         retrieval_query = f"{query}\n\nPrior finding context:\n{prior_turns[-1]}"
+    cache_key = None
+    cache_lock_token = None
+    if user_id and conversation:
+        revision = await current_index_revision(session)
+        cache_key = retrieval_cache_key(
+            user_id=user_id,
+            conversation_id=conversation.id,
+            query=retrieval_query,
+            index_revision=revision,
+        )
+        cached = await get_cached_retrieval(cache_key)
+        if cached is not None:
+            cached.notes = list(dict.fromkeys([*cached.notes, "session retrieval cache hit"]))
+            conversation.retrieval_workspace = workspace_update(
+                conversation.retrieval_workspace,
+                query=retrieval_query,
+                outcome=cached,
+            )
+            await session.commit()
+            return cached
+        cache_lock_token = await acquire_lock(cache_key)
+        if cache_lock_token is None:
+            deadline = time.monotonic() + settings.RETRIEVAL_CACHE_LOCK_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+                cached = await get_cached_retrieval(cache_key)
+                if cached is not None:
+                    cached.notes = list(dict.fromkeys([
+                        *cached.notes, "session retrieval cache hit after wait"
+                    ]))
+                    conversation.retrieval_workspace = workspace_update(
+                        conversation.retrieval_workspace,
+                        query=retrieval_query,
+                        outcome=cached,
+                    )
+                    await session.commit()
+                    return cached
     try:
-        return await asyncio.wait_for(
+        outcome = await asyncio.wait_for(
             federated_search(retrieval_query, session),
             timeout=45,
         )
+        if cache_key and conversation:
+            await put_cached_retrieval(cache_key, outcome)
+            conversation.retrieval_workspace = workspace_update(
+                conversation.retrieval_workspace,
+                query=retrieval_query,
+                outcome=outcome,
+            )
+            await session.commit()
+        return outcome
     except asyncio.TimeoutError:
         log.warning("Chat retrieval timed out; continuing without KB context")
         return SearchOutcome(
@@ -90,8 +153,25 @@ async def _conversation_outcome(
                 "the response is not grounded in the local KB"
             ],
         )
+    finally:
+        if cache_key:
+            await release_lock(cache_key, cache_lock_token)
 
 
+async def _owned_conversation(
+    conversation_id: str | None, user_id: str, session: AsyncSession
+) -> AnalysisConversation | None:
+    if not conversation_id:
+        return None
+    conversation = await session.scalar(
+        select(AnalysisConversation).where(
+            AnalysisConversation.id == conversation_id,
+            AnalysisConversation.user_id == user_id,
+        )
+    )
+    if conversation is None:
+        raise HTTPException(404, "Conversation not found")
+    return conversation
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _retrieval_inputs(messages: list[ChatMessage]) -> tuple[str, list[str]]:
@@ -362,7 +442,11 @@ def _safe_filename(name: str) -> str:
 # ── Standard JSON endpoint ───────────────────────────────────────────────────
 
 @router.post("")
-async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
+async def chat(
+    req: ChatRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User | None = Depends(get_current_active_user),
+):
     _validate_chat_model(req.model)
     """Standard non-streaming chat endpoint. Also handles action="validate"/"generate_report"."""
 
@@ -424,7 +508,14 @@ async def chat(req: ChatRequest, session: AsyncSession = Depends(get_session)):
 
     # normal conversational path
     query, prior_turns = _retrieval_inputs(req.messages)
-    outcome = await _conversation_outcome(query, prior_turns, session)
+    conversation = await _owned_conversation(
+        req.conversation_id, user.id, session
+    ) if user else None
+    outcome = await _conversation_outcome(
+        query, prior_turns, session,
+        user_id=user.id if user else None,
+        conversation=conversation,
+    )
     social_reply = _social_reply(query)
     if social_reply:
         return {"response": social_reply, **_provenance_payload(outcome)}
@@ -450,8 +541,10 @@ async def chat_with_evidence(
     messages: str = Form(...),          # JSON-encoded list of {"role", "content"}
     action: str | None = Form(None),    # "validate" or None (plain conversation with evidence attached)
     title: str | None = Form(None),
+    conversation_id: str | None = Form(None),
     files: list[UploadFile] = File(default=[]),
     session: AsyncSession = Depends(get_session),
+    user: User | None = Depends(get_current_active_user),
 ):
     try:
         parsed_messages = [ChatMessage(**m) for m in json.loads(messages)]
@@ -465,6 +558,9 @@ async def chat_with_evidence(
     ]
 
     full_description = "\n".join(m.content for m in parsed_messages if m.role == "user")
+    conversation = await _owned_conversation(
+        conversation_id, user.id, session
+    ) if user else None
 
     if action == "validate":
         try:
@@ -515,6 +611,13 @@ async def chat_with_evidence(
             evidence_texts=[*prior_turns, *evidence_texts],
             image_descriptions=image_descriptions,
         )
+        if conversation:
+            conversation.retrieval_workspace = workspace_update(
+                conversation.retrieval_workspace,
+                query=query,
+                outcome=outcome,
+            )
+            await session.commit()
     except Exception:
         cleanup_staged_evidence(parsed_files)
         raise
@@ -545,7 +648,11 @@ async def chat_with_evidence(
 # ── Streaming endpoint (unchanged — pure conversation) ──────────────────────
 
 @router.post("/stream")
-async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_session)):
+async def chat_stream(
+    req: ChatRequest,
+    session: AsyncSession = Depends(get_session),
+    user: User | None = Depends(get_current_active_user),
+):
     """
     SSE streaming chat endpoint.
     Response is text/event-stream with `data: <json>\n\n` frames.
@@ -563,10 +670,17 @@ async def chat_stream(req: ChatRequest, session: AsyncSession = Depends(get_sess
     _validate_chat_model(req.model)
     query, prior_turns = _retrieval_inputs(req.messages)
     social_reply = _social_reply(query)
+    conversation = await _owned_conversation(
+        req.conversation_id, user.id, session
+    ) if user else None
 
     async def event_generator():
         yield f"data: {json.dumps({'stage': {'key': 'retrieve', 'label': 'Searching knowledge', 'status': 'active', 'detail': 'Checking approved local sources'}})}\n\n"
-        outcome = await _conversation_outcome(query, prior_turns, session)
+        outcome = await _conversation_outcome(
+            query, prior_turns, session,
+            user_id=user.id if user else None,
+            conversation=conversation,
+        )
         messages = _bounded_provider_messages(req.messages)
         yield f"data: {json.dumps(_provenance_payload(outcome))}\n\n"
         yield f"data: {json.dumps({'stage': {'key': 'retrieve', 'label': 'Searching knowledge', 'status': 'complete', 'detail': outcome.provenance_line()}})}\n\n"
