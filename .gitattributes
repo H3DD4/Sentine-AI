@@ -19,3 +19,4 @@
 *.ico binary
 *.pdf binary
 *.docx binary
+*.jsonl.gz binary

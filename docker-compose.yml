@@ -1,38 +1,112 @@
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: sentinel_postgres
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: redteam_rag
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-redteam_rag}
     ports:
-      - "5544:5432"
+      - "${POSTGRES_PORT:-5544}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   qdrant:
-    image: qdrant/qdrant:latest
-    container_name: sentinel_qdrant
+    image: qdrant/qdrant:v1.14.1
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:6333/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   redis:
     image: redis:7-alpine
-    container_name: sentinel_redis
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     command: ["redis-server", "--appendonly", "yes"]
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment: &backend-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-redteam_rag}
+      QDRANT_URL: http://qdrant:6333
+      RETRIEVAL_CACHE_REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-docker-development-secret-change-before-production}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      NVD_API_KEY: ${NVD_API_KEY:-}
+      RESTORE_RETRIEVAL_SEED: ${RESTORE_RETRIEVAL_SEED:-true}
+      RETRIEVAL_SEED_DIR: /app/seed/retrieval
+      SEED_NVD: ${SEED_NVD:-false}
+      NVD_DAYS_BACK: ${NVD_DAYS_BACK:-30}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      SEED_MITRE: ${SEED_MITRE:-false}
+      SEED_OWASP: ${SEED_OWASP:-false}
+      SEED_FINDING_TEMPLATES: ${SEED_FINDING_TEMPLATES:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && python -m scripts.docker_init"]
+    restart: "no"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment: *backend-env
+    ports:
+      - "${BACKEND_PORT:-8002}:8002"
+    depends_on:
+      backend-migrate:
+        condition: service_completed_successfully
+    volumes:
+      - evidence_data:/tmp/redteam_evidence
+      - template_data:/tmp/redteam_report_templates
+      - report_data:/tmp/redteam_reports
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8002/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8002}
+    ports:
+      - "${FRONTEND_PORT:-8081}:8081"
+    depends_on:
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:
   qdrant_data:
   redis_data:
+  evidence_data:
+  template_data:
+  report_data:

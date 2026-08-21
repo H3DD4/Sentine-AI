@@ -1,0 +1,47 @@
+{
+  "format": 1,
+  "embedding_signature": "BAAI/bge-m3|Qdrant/bm25|800|100|self-describing-chunks-v2",
+  "sources": {
+    "nvd": {
+      "table": "nvd_entries",
+      "collection": "kb_nvd",
+      "rows": 10459,
+      "points": 10600,
+      "rows_sha256": "344f0477e42986417e786a17f59a906a9677b7574cda753dc467d56fb62bb636",
+      "points_sha256": "adc30d2e1dc03b12e192227e2210a639c3fba4aef0bf853baf0818384c96bdb8"
+    },
+    "mitre": {
+      "table": "mitre_techniques",
+      "collection": "kb_mitre",
+      "rows": 858,
+      "points": 892,
+      "rows_sha256": "a22f3623a687a797e8352b3c9e6ffc89cfafade7c41adeea19c31aa79c44074e",
+      "points_sha256": "50f0b4ca631b5b178f23382f64717898282b04207ff03aebd6e374df6450e97b"
+    },
+    "owasp": {
+      "table": "owasp_top10",
+      "collection": "kb_owasp",
+      "rows": 20,
+      "points": 44,
+      "rows_sha256": "47c8b217c4a93a939da9851623670abb970fbc1fc3d3e79ce96d35acd42b2170",
+      "points_sha256": "a67dc9e483a8789e645a33ff5c88576ff422d22ab2392e505124f1517e7f9c5c"
+    },
+    "owasp_docs": {
+      "table": "owasp_documents",
+      "collection": "kb_owasp_docs",
+      "rows": 327,
+      "points": 1431,
+      "rows_sha256": "e03c7a839e93733563bca0ac86546f6da63879c2545999f34af883b07b788ace",
+      "points_sha256": "f40fa09cfa27091aa3575f443ba9269ec4e23c86d7f0db730d729df455b706d5"
+    },
+    "finding_templates": {
+      "table": "finding_templates",
+      "collection": "kb_finding_templates",
+      "rows": 314,
+      "points": 315,
+      "rows_sha256": "6cda8471f5c8ea55d0b00ae2f0b9d389fe608c1000dab772ec7d6af785c736a3",
+      "points_sha256": "9dc310d26262c510e28bda0d85206fe893c00d1ba0ea90917410f83222e393b8"
+    }
+  },
+  "warning": "Seed excludes users, client data, Ghostwriter, internal notes, and application records."
+}
