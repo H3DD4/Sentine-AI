@@ -17,7 +17,7 @@ import { apiFetch } from "./auth";
 
 // Vite runs separately in development; deployed builds use the current origin.
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "");
-const API_BASE = configuredApiBase ?? "http://localhost:8000";
+const API_BASE = configuredApiBase ?? "http://localhost:8002";
 
 // ─── Types ────────────────────────────────────────────────────────────
 

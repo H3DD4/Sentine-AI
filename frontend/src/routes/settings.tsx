@@ -60,6 +60,8 @@ const PROVIDERS = [
     label: "OpenRouter",
     icon: Globe,
     models: [
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "z-ai/glm-5.2:free",
       "mistralai/mistral-7b-instruct:free",
       "meta-llama/llama-3.2-3b-instruct:free",
       "google/gemma-2-9b-it:free",

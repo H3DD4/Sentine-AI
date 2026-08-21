@@ -12,7 +12,7 @@ const USER_KEY = "sentinel.auth.user";
 
 const API_BASE =
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ??
-  "http://localhost:8000";
+  "http://localhost:8002";
 
 export interface AuthUser {
   id: string;
