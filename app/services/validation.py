@@ -22,8 +22,6 @@ import asyncio
 import logging
 import re
 
-from cvss import CVSS3, CVSS4
-from cvss.exceptions import CVSS3MalformedError, CVSS4MalformedError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.kb.base import SearchOutcome
@@ -31,6 +29,7 @@ from app.config import settings
 from app.schemas import ValidationResult
 from app.services.llm_client import AsyncLLMClient
 from app.services.retrieval import multimodal_search
+from app.services.cvss_tool import calculate_cvss
 
 log = logging.getLogger(__name__)
 
@@ -259,9 +258,10 @@ def impact_narrative(result: ValidationResult) -> str:
 
 def _calculated_cvss(vector: str) -> tuple[str, float, str]:
     """Parse a CVSS vector and return its canonical vector, score, and severity."""
-    vector = str(vector or "").strip()
-    calculator = CVSS4(vector) if vector.startswith("CVSS:4.0/") else CVSS3(vector)
-    return calculator.clean_vector(), float(calculator.scores()[0]), calculator.severities()[0].lower()
+    result = calculate_cvss(vector)
+    if result["status"] != "valid":
+        raise ValueError(result.get("error") or "Invalid CVSS vector")
+    return result["canonical_vector"], result["score"], result["severity"]
 
 
 def _normalize_cvss(assessment: dict) -> bool:
@@ -319,7 +319,7 @@ def _normalize_cvss(assessment: dict) -> bool:
                 "upper_bound": None,
             })
         return True
-    except (CVSS3MalformedError, CVSS4MalformedError, KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         assessment["cvss"] = {
             "status": "pending_evidence",
             "version": "",

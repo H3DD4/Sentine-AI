@@ -20,6 +20,13 @@ from app.kb.base import RetrievalHit, SearchOutcome
 from app.schemas import CVSSAssessment, ImpactClaim, SecurityMapping
 from app.services.llm_client import AsyncLLMClient
 from app.services.validation import _calculated_cvss, _normalize_assessment, build_context_block
+from app.services.cvss_tool import calculate_cvss
+from app.services.mcp_tools import (
+    calculate_cvss_via_mcp,
+    extract_cvss_tool_request,
+    render_cvss_tool_result,
+    validate_draft_cvss_via_mcp,
+)
 
 
 StageCallback = Callable[[str, str, str, str], Awaitable[None]]
@@ -204,8 +211,14 @@ Rules:
   must list every material missing condition.
 - Never infer production status, role permissions, data access, customer scope, rotation,
   regulatory applicability, destructive capability, or business criticality.
-- Use CVSS exact only when the analyst supplied a complete vector. Otherwise use a range with
-  explicit assumptions or pending_evidence. Never calculate a score; Python does that.
+- If the analyst supplied a complete CVSS vector in the current turn, use that vector. Otherwise
+  propose complete candidate vector(s) from current-target evidence and assumptions. The application
+  sends every candidate to the deterministic calculate_cvss tool; never calculate a score yourself.
+- A successful tool result proves only that the submitted vector is syntactically valid and gives its
+  deterministic score. It does not prove that the candidate metrics are applicable. In particular,
+  do not assert Scope Changed (S:C) unless different security authorities are demonstrated; a
+  different technology layer, cloud service, or team is not sufficient. If the boundary is unknown,
+  state that S:C is conditional and that S:U is the unresolved alternative.
 - Ghostwriter and internal templates are precedent and wording only, never current-target proof.
 - Recommendations may appear in answer_markdown when requested, but must not be described as
   retrieved unless supported by a [KBn] citation.
@@ -220,11 +233,19 @@ business impact, or CVSS values. A retrieved record is context, not proof that t
 has the same issue. Cite retrieved records only with their labels, such as [KB1], when relevant.
 Do not include CVSS scores, severity labels, CVSS vectors, or canonical identifier/source citations
 unless they were supplied in the current user turn; Python will render or remove authoritative
-values when applicable. Do not provide exploit code or attack payloads. Do not add remediation
-advice unless the user explicitly asks for it.
+values when applicable. When the user requests a CVSS score without a complete current-turn vector,
+return only {"tool":"calculate_cvss","arguments":{"vector":"COMPLETE_VECTOR"}}. Never return
+empty arguments. The application will call the tool and provide its result before you answer. Do
+not provide exploit code or attack payloads. Do not add remediation advice unless the user explicitly
+asks for it.
 
-Return normal Markdown prose. Do not return JSON, a schema, markdown fences around JSON, or a
-discussion of these instructions."""
+The CVSS tool result is authoritative for score, severity, and canonical vector only. It is not
+evidence that the candidate metrics are applicable. Never present S:C as established when the
+security-authority boundary is unconfirmed; explain the uncertainty and do not silently substitute
+your own score or vector.
+
+Return normal Markdown prose after the tool result is provided. Do not return JSON for ordinary
+responses, a schema, markdown fences around JSON, or a discussion of these instructions."""
 
 
 def _conversation_text(messages: Sequence[dict]) -> str:
@@ -251,6 +272,9 @@ def build_draft_request(messages: Sequence[dict], outcome: SearchOutcome) -> str
     return f"""=== CONVERSATION AND CURRENT-TARGET MATERIAL ===
 {_conversation_text(messages)}
 
+=== DETERMINISTIC LEDGER (IMMUTABLE) ===
+{_deterministic_ledger_text(messages, outcome)}
+
 === DATA COVERAGE ===
 {outcome.provenance_line()}
 
@@ -264,6 +288,9 @@ def build_text_request(messages: Sequence[dict], outcome: SearchOutcome) -> str:
     return f"""=== CONVERSATION AND CURRENT-TARGET MATERIAL ===
 {_conversation_text(messages)}
 
+=== DETERMINISTIC LEDGER (IMMUTABLE) ===
+{_deterministic_ledger_text(messages, outcome)}
+
 === DATA COVERAGE ===
 {outcome.provenance_line()}
 
@@ -271,6 +298,100 @@ def build_text_request(messages: Sequence[dict], outcome: SearchOutcome) -> str:
 {build_context_block(outcome)}
 
 Answer the latest user turn directly. Treat record labels and IDs as immutable data."""
+
+
+def _deterministic_ledger(messages: Sequence[dict], outcome: SearchOutcome) -> dict:
+    """Calculate values already knowable before generation; never infer attack semantics."""
+    analyst_material = "\n\n".join(
+        str(message.get("content") or "")
+        for message in messages
+        if str(message.get("role") or "").lower() == "user"
+    )
+    calculations = []
+    seen = set()
+    for raw_vector in _USER_CVSS_VECTOR.findall(analyst_material):
+        identity = _vector_identity(raw_vector)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        try:
+            vector, score, severity = _calculated_cvss(raw_vector.upper())
+        except Exception as exc:
+            calculations.append({
+                "type": "cvss",
+                "input": raw_vector,
+                "status": "invalid",
+                "error": type(exc).__name__,
+            })
+            continue
+        calculations.append({
+            "id": f"CVSS_CALC_{len(calculations) + 1}",
+            "type": "cvss_v4_0" if vector.startswith("CVSS:4.0/") else "cvss_v3_1",
+            "input_source": "analyst_conversation",
+            "canonical_vector": vector,
+            "score": score,
+            "severity": severity,
+            "status": "valid",
+        })
+    return {
+        "calculations": calculations,
+        "coverage": {
+            "retrieved_hit_count": len(outcome.hits),
+            "sources_used": list(outcome.sources_used),
+            "degraded": outcome.degraded,
+        },
+        "constraints": [
+            "Calculated values are authoritative and must not be recalculated or altered.",
+            "An invalid or missing calculation must remain unresolved.",
+            "Retrieved records are context, not proof about the current target.",
+            "When no analyst vector is present, call calculate_cvss for every complete candidate vector before assigning a score.",
+        ],
+        "available_tools": [{
+            "name": "calculate_cvss",
+            "purpose": "Validate and calculate a complete CVSS 3.1 or 4.0 vector.",
+            "arguments": {"vector": "Complete candidate CVSS vector"},
+        }],
+    }
+
+
+def _deterministic_ledger_text(
+    messages: Sequence[dict], outcome: SearchOutcome
+) -> str:
+    return json.dumps(
+        _deterministic_ledger(messages, outcome),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _analyst_authoritative_tokens(messages: Sequence[dict]) -> list[str]:
+    """Keep analyst-requested identifiers visible without asserting applicability."""
+    return list(dict.fromkeys(
+        match.group(0).upper()
+        for message in messages
+        if str(message.get("role") or "").lower() == "user"
+        for match in _AUTHORITATIVE_TOKEN.finditer(str(message.get("content") or ""))
+        if not match.group(0).upper().startswith("CVSS:")
+    ))
+
+
+def _render_ledger_calculations(messages: Sequence[dict], outcome: SearchOutcome) -> str:
+    calculations = _deterministic_ledger(messages, outcome)["calculations"]
+    if not calculations:
+        return ""
+    lines = ["**Deterministic calculations**"]
+    for calculation in calculations:
+        if calculation["status"] != "valid":
+            lines.append(
+                f"- Invalid CVSS input: `{calculation['input']}`. No score was produced."
+            )
+            continue
+        lines.append(
+            f"- {calculation['id']}: **{calculation['score']:.1f} "
+            f"{calculation['severity'].title()}** `{calculation['canonical_vector']}` "
+            "(calculated by Python from the analyst-supplied vector)"
+        )
+    return "\n".join(lines)
 
 
 def _empty_draft(reason: str) -> GroundedChatDraft:
@@ -285,68 +406,49 @@ def _empty_draft(reason: str) -> GroundedChatDraft:
 def _deterministic_fallback_draft(
     user_text: str, outcome: SearchOutcome, reason: str
 ) -> GroundedChatDraft:
-    """Produce useful, non-authoritative output when every model draft fails."""
-    text = user_text.lower()
-    retrieved = " ".join(hit.text.lower() for hit in outcome.hits)
-    evidence = f"{text} {retrieved}"
-    french = bool(re.search(r"\b(?:tu|une|avec|preuve|port[eé]e|jeton)\b", text))
-    ssrf = (
-        "ssrf" in evidence
-        or "server side request forgery" in evidence
-        or ("metadata" in evidence and "server" in evidence and "url" in evidence)
-    )
-    command_injection = (
-        "command injection" in evidence
-        or "os command" in evidence
-        or "operating-system command" in evidence
-        or ("shell metacharacter" in evidence and ("uid=" in text or "gid=" in text))
-    )
-    command_output = " ".join(dict.fromkeys(
-        match.group(0) for match in re.finditer(
-            r"\b(?:uid|gid)=\d+(?:\([^\r\n)]{1,80}\))?", user_text, re.IGNORECASE
+    """Report generic deterministic state when LLM reasoning is unavailable."""
+    french = bool(re.search(r"\b(?:les|une|avec|preuve|port[eé]e|jeton|analyse)\b", user_text.lower()))
+    heading = "Analyse incomplète" if french else "Incomplete analysis"
+    if french:
+        answer = (
+            f"## {heading}\n\n"
+            "L'analyse LLM est indisponible. Aucun jugement technique ou métier dépendant du modèle "
+            "n'est présenté comme établi.\n\n"
+            f"**Récupération** : {len(outcome.hits)} résultat(s) ont été récupérés auprès des sources locales.\n\n"
+            "**Contrôles déterministes** : la structure, la provenance, les identifiants retrouvés et "
+            "les valeurs calculables peuvent être vérifiés par le système ; aucune conclusion nouvelle "
+            "n'est déduite ici.\n\n"
+            "**Analyse restante** : interprétation du scénario, impact, applicabilité des références, "
+            "remédiation et criticité nécessitent une réponse LLM ou une validation humaine."
         )
-    ))
-    timeout = "timeout" in text or "time out" in text
-    mechanism = (
-        f"Le matériel fourni contient la sortie {command_output}, cohérente avec l'exécution d'une commande système via le paramètre testé."
-        if french and command_injection and command_output else
-        f"The supplied material contains {command_output}, consistent with OS command injection through the tested parameter."
-        if command_injection and command_output else
-        "Le contexte récupéré contient une référence à un mécanisme d'injection de commande système."
-        if french and command_injection else
-        "The retrieved context contains a reference to an OS command injection mechanism."
-        if command_injection else
-        "Le contexte récupéré contient une référence au mécanisme SSRF."
-        if french and ssrf else
-        "Retrieved context contains a reference to the SSRF mechanism."
-        if ssrf else
-        "The retrieved context does not establish an exact vulnerability mechanism."
-    )
-    contradiction = (
-        "Une contradiction ou un résultat de timeout doit rester non résolu et être vérifié dans le même environnement."
-        if french and timeout else
-        "A contradictory or timeout result remains unresolved and must be verified in the same environment."
-        if timeout else "No cross-run contradiction was deterministically established."
-    )
-    missing = (
-        "Les métriques CVSS, l'impact et les correspondances autoritatives restent à confirmer par des preuves."
-        if french else
-        "CVSS metrics, impact, and authoritative mappings remain to be confirmed with evidence."
-    )
-    heading = "Analyse conservatrice" if french else "Conservative analysis"
-    answer = (
-        f"## {heading}\n\n"
-        + ("Le modèle n'a pas fourni de brouillon structuré valide. Le système conserve uniquement les faits contrôlables.\n\n" if french
-           else "The model did not provide a valid structured draft. The system retains only mechanically supportable facts.\n\n")
-        + mechanism + "\n\n"
-        + contradiction + "\n\n"
-        + missing
-    )
+    else:
+        answer = (
+            f"## {heading}\n\n"
+            "LLM analysis is unavailable. No model-dependent technical or business judgment is "
+            "presented as established.\n\n"
+            f"**Retrieval**: {len(outcome.hits)} result(s) were retrieved from local sources.\n\n"
+            "**Deterministic checks**: structure, provenance, retrieved identifiers, and calculable "
+            "values can be checked by the system; no new conclusion is inferred here.\n\n"
+            "**Remaining analysis**: scenario interpretation, impact, reference applicability, "
+            "remediation, and business criticality require an LLM response or human validation."
+        )
+    evidence_lines = []
+    for index, hit in enumerate(outcome.hits[:5], 1):
+        excerpt = " ".join(hit.text.split())[:300]
+        if excerpt:
+            evidence_lines.append(f"- [KB{index}] {excerpt}")
+    if evidence_lines:
+        answer += ("\n\n**Faits de contexte récupérés**\n" if french else "\n\n**Retrieved context facts**\n")
+        answer += "\n".join(evidence_lines)
     return GroundedChatDraft(
         answer_markdown=answer,
         cvss=ProposedCVSSAssessment(
             status="pending_evidence",
-            rationale=missing,
+            rationale=(
+                "Les métriques restent à confirmer par une analyse LLM ou humaine."
+                if french else
+                "Metrics remain to be confirmed by LLM or human analysis."
+            ),
             unresolved_metrics=["Analyst confirmation required before scoring."],
         ),
         limitations=[reason],
@@ -407,6 +509,35 @@ def _normalize_draft(
     supplied_vectors = {
         _vector_identity(value) for value in _USER_CVSS_VECTOR.findall(user_text)
     }
+    # An explicit vector in the current analyst turn is authoritative and takes
+    # precedence over any conflicting model proposal.
+    if len(supplied_vectors) == 1:
+        explicit = next(iter(supplied_vectors))
+        raw_explicit = next(
+            (value for value in _USER_CVSS_VECTOR.findall(user_text)
+             if _vector_identity(value) == explicit),
+            "",
+        )
+        calculated = calculate_cvss(raw_explicit.upper())
+        if calculated["status"] == "valid":
+            cvss = {
+                "status": "exact",
+                "version": calculated["version"],
+                "vector": calculated["canonical_vector"],
+                "score": calculated["score"],
+                "severity": calculated["severity"],
+                "rationale": "Calculated from the complete vector supplied by the analyst.",
+                "lower_bound": None,
+                "upper_bound": None,
+                "unresolved_metrics": [],
+            }
+        else:
+            cvss = {
+                "status": "pending_evidence", "version": "", "vector": "",
+                "score": None, "severity": "", "rationale": calculated["error"],
+                "lower_bound": None, "upper_bound": None,
+                "unresolved_metrics": ["A complete valid CVSS vector is required."],
+            }
     status = cvss.get("status")
     proposed_identities = []
     if status == "exact":
@@ -420,7 +551,10 @@ def _normalize_draft(
         bool(proposed_identities)
         and all(identity is not None and identity in supplied_vectors for identity in proposed_identities)
     )
-    if status in {"exact", "range"} and not vectors_admissible:
+    # Without an explicit analyst vector, model-proposed vectors are allowed only
+    # after _normalize_assessment has sent them through the deterministic tool.
+    # With an explicit vector, the authoritative replacement above already wins.
+    if status in {"exact", "range"} and supplied_vectors and not vectors_admissible:
         cvss = {
             "status": "pending_evidence",
             "version": "",
@@ -560,6 +694,32 @@ def _safe_retrieved_text(value: str, *, limit: int) -> str:
 
 def _safe_citation_component(value: str, *, limit: int) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", str(value or "")[:limit]) or "unknown"
+
+
+def _allowed_authoritative_tokens(
+    outcome: SearchOutcome | None,
+    extra: Sequence[str] = (),
+) -> set[str]:
+    """Return identifiers already present in analyst input or retrieved records."""
+    allowed = {str(value).strip().upper() for value in extra if value}
+    if outcome is None:
+        return allowed
+    def collect(value) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                collect(item)
+            return
+        for match in _AUTHORITATIVE_TOKEN.finditer(str(value or "")):
+            allowed.add(match.group(0).upper())
+
+    for hit in outcome.hits:
+        collect(hit.doc_id)
+        collect(hit.payload or {})
+    return allowed
 
 
 def _render_cvss(
@@ -718,10 +878,18 @@ def _sanitize_model_text(
     *,
     strip_cvss_metrics: bool = False,
     outcome: SearchOutcome | None = None,
+    allowed_authoritative_tokens: Sequence[str] = (),
 ) -> str:
     """Drop unsafe sentences instead of leaking diagnostic placeholders."""
     text = str(value or "")
     protected: dict[str, str] = {}
+    allowed = _allowed_authoritative_tokens(outcome, allowed_authoritative_tokens)
+    for match in _AUTHORITATIVE_TOKEN.finditer(text):
+        if match.group(0).upper() not in allowed:
+            continue
+        token = f"__SAFE_AUTH_{uuid.uuid4().hex}__"
+        protected[token] = match.group(0)
+        text = text.replace(match.group(0), token, 1)
     if outcome is not None:
         for match in _KB_REFERENCE.finditer(text):
             index = int(match.group(1))
@@ -820,7 +988,12 @@ def _normalize_identifier_alias(value, field: str) -> str:
     return alias
 
 
-def render_grounded_response(result: GroundingResult, outcome: SearchOutcome) -> str:
+def render_grounded_response(
+    result: GroundingResult,
+    outcome: SearchOutcome,
+    *,
+    include_provenance: bool = True,
+) -> str:
     """Render authoritative fields from validated Python objects, never model prose."""
     draft = result.draft
     strip_cvss_metrics = result.itemized_cvss
@@ -912,7 +1085,8 @@ def render_grounded_response(result: GroundingResult, outcome: SearchOutcome) ->
             "**Grounding status**",
             "- Some generated proposals were rejected or conservatively rewritten by deterministic validation.",
         ]
-    lines += ["", f"_{outcome.provenance_line()}_"]
+    if include_provenance:
+        lines += ["", f"_{outcome.provenance_line()}_"]
     return "\n".join(lines).strip()
 
 
@@ -979,7 +1153,11 @@ async def generate_structured_response(
         text_evidence_count=text_evidence_count,
         image_evidence_count=image_evidence_count,
     )
-    result.issues = list(dict.fromkeys([*parse_issues, *result.issues]))
+    mcp_issues = await validate_draft_cvss_via_mcp(
+        draft,
+        explicit_vector_present=bool(_USER_CVSS_VECTOR.search(user_text)),
+    )
+    result.issues = list(dict.fromkeys([*parse_issues, *mcp_issues, *result.issues]))
     if used_deterministic_fallback:
         result.generation_status = "deterministic_fallback"
     elif _draft_is_substantively_empty(result.draft):
@@ -1031,8 +1209,12 @@ async def generate_structured_response(
                 text_evidence_count=text_evidence_count,
                 image_evidence_count=image_evidence_count,
             )
+            revised_mcp_issues = await validate_draft_cvss_via_mcp(
+                revised,
+                explicit_vector_present=bool(_USER_CVSS_VECTOR.search(user_text)),
+            )
             revised_result.issues = list(dict.fromkeys([
-                *revised_parse_issues, *revised_result.issues
+                *revised_parse_issues, *revised_mcp_issues, *revised_result.issues
             ]))
             if (
                 revised_result.draft.answer_markdown.strip()
@@ -1098,17 +1280,92 @@ async def generate_conversational_response(
     """
     if stage:
         await stage("draft", "Drafting analysis", "active", "Generating a natural-language answer")
-    raw = await client.generate(
-        messages=[{"role": "user", "content": build_text_request(messages, outcome)}],
-        system=CHAT_TEXT_SYSTEM,
-        max_tokens=5000,
-        model=model,
-    )
+    user_text = _conversation_text(messages)
+    try:
+        raw_parts = []
+        generation_messages = [{"role": "user", "content": build_text_request(messages, outcome)}]
+        for continuation in range(3):
+            raw_parts.append(await client.generate(
+                messages=generation_messages,
+                system=CHAT_TEXT_SYSTEM,
+                max_tokens=5000,
+                model=model,
+            ))
+            if str(client.last_finish_reason or "").lower() not in {
+                "length", "max_tokens", "max_output_tokens"
+            }:
+                break
+            generation_messages = [
+                *generation_messages,
+                {"role": "assistant", "content": raw_parts[-1]},
+                {"role": "user", "content": (
+                    "Continue exactly where you stopped. Do not repeat prior sections "
+                    "or source tables. Complete the remaining requested content."
+                )},
+            ]
+        raw = "".join(raw_parts)
+        mcp_calculation = None
+        arguments = extract_cvss_tool_request(raw)
+        if arguments is None and _USER_CVSS_VECTOR.search(user_text):
+            arguments = {"vector": _USER_CVSS_VECTOR.search(user_text).group(0)}
+        if arguments is not None:
+            vector = str(arguments.get("vector") or "").strip()
+            if vector:
+                mcp_calculation = await calculate_cvss_via_mcp(vector)
+                raw = await client.generate(
+                    messages=[
+                        *generation_messages,
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": (
+                            "The deterministic calculate_cvss tool returned:\n"
+                            + json.dumps(mcp_calculation, ensure_ascii=False, sort_keys=True)
+                            + "\nUse these values exactly and answer the user normally."
+                        )},
+                    ],
+                    system=CHAT_TEXT_SYSTEM,
+                    max_tokens=5000,
+                    model=model,
+                )
+    except Exception as exc:
+        reason = (
+            f"The model provider was unavailable ({type(exc).__name__}); "
+            "deterministic fallback retained."
+        )
+        fallback = _deterministic_fallback_draft(user_text, outcome, reason)
+        result = validate_draft(
+            fallback,
+            outcome,
+            user_text=user_text,
+            text_evidence_count=text_evidence_count,
+            image_evidence_count=image_evidence_count,
+        )
+        result.generation_status = "deterministic_fallback"
+        result.issues = [reason, *result.issues]
+        if stage:
+            await stage(
+                "draft", "Drafting analysis", "complete",
+                "Provider unavailable; safe fallback prepared",
+            )
+            await stage(
+                "finalize", "Finalizing response", "complete",
+                "Grounded fallback response ready",
+            )
+        rendered = render_grounded_response(result, outcome, include_provenance=False)
+        return rendered, [reason]
     if stage:
         await stage("draft", "Drafting analysis", "complete", "Natural-language response received")
         await stage("finalize", "Finalizing response", "active", "Applying deterministic grounding cleanup")
-    cleaned = _sanitize_model_text(raw, outcome=outcome)
+    cleaned = _sanitize_model_text(
+        raw,
+        outcome=outcome,
+        allowed_authoritative_tokens=_analyst_authoritative_tokens(messages),
+    )
+    calculations = _render_ledger_calculations(messages, outcome)
     issues: list[str] = []
+    if extract_cvss_tool_request(cleaned) is not None:
+        cleaned = "**Technical severity**\n- Pending evidence. No complete CVSS vector was provided to the deterministic tool."
+    if mcp_calculation is not None:
+        cleaned = f"{cleaned}\n\n{render_cvss_tool_result(mcp_calculation)}".strip()
     if cleaned != str(raw or "").strip():
         issues.append("Some unsupported identifiers, citations, or authoritative values were removed.")
     if stage:
